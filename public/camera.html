@@ -13,14 +13,21 @@
     #status { margin-top: 10px; color: var(--hud-dim); }
     .val { color: #fff; float: right; }
     .hint { color: var(--hud-dim); font-size: 0.8rem; }
+    .presets { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .presets button { padding: 10px 6px; font-size: 0.8rem; }
+    .presets button small { display: block; color: var(--hud-dim); font-size: 0.7rem; margin-top: 2px; }
   </style>
 </head>
 <body>
   <h2 id="title">ROOM CAMERA</h2>
   <video id="video" autoplay playsinline muted></video>
 
+  <label>Position preset (front · right · behind · left · below)</label>
+  <div class="presets" id="presets"></div>
+  <div class="hint">Each camera sits ~0.8 m from the pilot at chest height, lens pointing <b>away</b> from them. Laptops: screen faces outward.</div>
+
   <label>Name</label>
-  <input id="name" type="text" placeholder="e.g. FLOOR, LEFT WING" />
+  <input id="name" type="text" placeholder="e.g. BELOW, LEFT WING" />
 
   <label>Lens</label>
   <select id="facing">
@@ -54,6 +61,20 @@
 
     let ws, stream, slot = null, sent = 0, timer;
 
+    // Typical horizontal FOV in landscape. Fine-tune live from /control while someone wears the headset.
+    const PHONE_FOV = 68, LAPTOP_FOV = 65;
+    const PRESETS = [
+      // Tilted slightly down so one camera covers both eye level and your hands
+      { name: 'FRONT', heading: 0, pitch: -15, fov: PHONE_FOV, who: 'phone A' },
+      { name: 'BELOW', heading: 0, pitch: -90, fov: PHONE_FOV, who: 'phone B' },
+      { name: 'RIGHT', heading: 90, pitch: 0, fov: LAPTOP_FOV, who: 'laptop 1' },
+      { name: 'BEHIND', heading: 180, pitch: 0, fov: LAPTOP_FOV, who: 'laptop 2' },
+      { name: 'LEFT', heading: 270, pitch: 0, fov: LAPTOP_FOV, who: 'laptop 3' },
+    ];
+    const isPhone = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+    if (localStorage.getItem('cam.fov') === null) $('fov').value = isPhone ? PHONE_FOV : LAPTOP_FOV;
+    if (localStorage.getItem('cam.facing') === null && !isPhone) $('facing').value = 'user';
+
     // Persist settings so a refresh doesn't lose calibration
     for (const id of ['name', 'heading', 'pitch', 'fov', 'facing']) {
       const saved = localStorage.getItem('cam.' + id);
@@ -65,6 +86,27 @@
       });
     }
     $('facing').addEventListener('change', () => stream && startCamera());
+
+    function apply(values) {
+      for (const [k, v] of Object.entries(values)) {
+        if (!$(k) || k === 'facing') continue;
+        $(k).value = v;
+        localStorage.setItem('cam.' + k, v);
+      }
+      updateLabels();
+    }
+
+    for (const p of PRESETS) {
+      const b = document.createElement('button');
+      b.innerHTML = `${p.name} ${p.heading}°/${p.pitch}°<small>${p.who}</small>`;
+      b.onclick = () => {
+        // Keep a FOV the user already calibrated on this device
+        apply({ name: p.name, heading: p.heading, pitch: p.pitch, ...(localStorage.getItem('cam.fovTuned') ? {} : { fov: p.fov }) });
+        sendInfo();
+      };
+      $('presets').appendChild(b);
+    }
+    $('fov').addEventListener('input', () => localStorage.setItem('cam.fovTuned', '1'));
 
     function updateLabels() {
       $('headingVal').textContent = $('heading').value + '°';
@@ -106,6 +148,11 @@
           slot = msg.slot;
           $('title').textContent = `ROOM CAMERA // SLOT ${slot + 1}`;
           sendInfo();
+        }
+        if (msg.type === 'set') {
+          // Remote tweak from /control
+          apply(msg.info);
+          if ('fov' in msg.info) localStorage.setItem('cam.fovTuned', '1');
         }
       };
       ws.onclose = () => {

@@ -30,6 +30,9 @@
 
       <div class="check"><input type="checkbox" id="stereo" checked /><label for="stereo">Split-screen for cardboard lenses</label></div>
 
+      <div class="check"><input type="checkbox" id="autoSync" checked /><label for="autoSync">Auto-sync to room cameras</label></div>
+      <div class="hint">Keeps lining the headset up with the room cameras by matching what they see. <b>Hold</b> anywhere to force a full sync.</div>
+
       <label>Field of view <span class="val" id="fovVal">90°</span></label>
       <input id="fov" type="range" min="50" max="120" value="90" />
 
@@ -46,8 +49,8 @@
 
       <p class="hint">
         In the headset: <b>tap</b> the screen (or cardboard button) to switch mode ·
-        <b>hold</b> to recenter (look straight ahead first).<br />
-        On a laptop: drag to look, keys <b>1/2/3</b> for modes, <b>R</b> to recenter.<br />
+        <b>hold</b> to sync with the room cameras (works facing any camera).<br />
+        On a laptop: drag to look, keys <b>1/2/3</b> for modes, <b>R</b> to sync.<br />
         Modes: <b>XRAY</b> see through your hands · <b>DAS</b> room cameras only · <b>PASS</b> plain camera.
       </p>
     </div>

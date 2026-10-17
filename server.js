@@ -44,10 +44,14 @@ const MIME = {
   '.svg': 'image/svg+xml',
 };
 
-const ROUTES = { '/': 'index.html', '/camera': 'camera.html', '/headset': 'headset.html' };
+const ROUTES = { '/': 'index.html', '/camera': 'camera.html', '/headset': 'headset.html', '/control': 'control.html' };
 
 const server = https.createServer(loadCert(), (req, res) => {
   const url = new URL(req.url, 'https://x');
+  if (url.pathname === '/ips.json') {
+    res.writeHead(200, { 'Content-Type': MIME['.json'] });
+    return res.end(JSON.stringify({ ips: lanIPs(), port: PORT }));
+  }
   const rel = ROUTES[url.pathname] || url.pathname.slice(1);
   const file = path.normalize(path.join(PUBLIC, rel));
   if (!file.startsWith(PUBLIC)) return res.writeHead(403).end();
@@ -84,6 +88,18 @@ wss.on('connection', (ws, req) => {
   if (role === 'viewer') {
     viewers.add(ws);
     ws.send(JSON.stringify({ type: 'cameras', list: cameraList() }));
+    // The control page can retune a camera remotely (handy when a laptop is turned to face away)
+    ws.on('message', (data, isBinary) => {
+      if (isBinary) return;
+      try {
+        const msg = JSON.parse(data.toString());
+        const c = cameras.get(msg.slot);
+        if (msg.type !== 'set' || !c) return;
+        c.info = { ...c.info, ...msg.info };
+        c.ws.send(JSON.stringify({ type: 'set', info: msg.info }));
+        broadcastList();
+      } catch {}
+    });
     ws.on('close', () => viewers.delete(ws));
     return;
   }
@@ -102,7 +118,7 @@ wss.on('connection', (ws, req) => {
           const msg = JSON.parse(data.toString());
           if (msg.type === 'info') {
             const c = cameras.get(slot);
-            c.info = { ...c.info, ...msg.info };
+            if (c) c.info = { ...c.info, ...msg.info };
             broadcastList();
           }
         } catch {}
@@ -126,7 +142,8 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('\n  VisionAiry running. On each phone, open:\n');
+  console.log('\n  VisionAiry running. On every other device, open:\n');
   for (const ip of lanIPs()) console.log(`    https://${ip}:${PORT}`);
-  console.log('\n  (Accept the certificate warning. All devices must be on the same Wi-Fi.)\n');
+  console.log(`\n  On this laptop:  https://localhost:${PORT}/control  (camera map + remote tuning)`);
+  console.log('  (Accept the certificate warning. All devices must be on the same Wi-Fi.)\n');
 });
