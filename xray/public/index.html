@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VisionAiry XRAY</title>
+<style>
+  :root { --hud: #39ff6a; --hud-dim: #1c7a35; --alert: #ff3b3b; --bg: #000; --panel: #04110a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--hud); font-family: ui-monospace, Menlo, monospace; }
+  body { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--hud-dim); }
+  header h1 { margin: 0; font-size: 1.1rem; letter-spacing: 0.3em; }
+  header h1 span { color: #fff; }
+  .stat { color: var(--hud-dim); font-size: 0.85rem; }
+  .stat b { color: var(--hud); font-weight: normal; }
+  .stat b.bad { color: var(--alert); }
+  main { display: grid; grid-template-columns: minmax(280px, 1fr) 2fr; grid-template-rows: 1fr 1fr; gap: 10px; padding: 10px 16px; min-height: 0; }
+  .panel { position: relative; background: var(--panel); border: 1px solid var(--hud-dim); min-height: 0; min-width: 0; }
+  .panel h2 { position: absolute; top: 6px; left: 10px; margin: 0; font-size: 0.7rem; font-weight: normal; letter-spacing: 0.2em; color: var(--hud-dim); z-index: 1; }
+  .panel canvas { display: block; width: 100%; height: 100%; }
+  #radarPanel { grid-row: span 2; }
+  #verdict { position: absolute; left: 0; right: 0; bottom: 18px; text-align: center; font-size: 1.6rem; letter-spacing: 0.3em; }
+  #verdict small { display: block; font-size: 0.7rem; letter-spacing: 0.15em; color: var(--hud-dim); margin-top: 4px; }
+  #verdict.alert { color: var(--alert); text-shadow: 0 0 12px var(--alert); }
+  footer { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; padding: 10px 16px; border-top: 1px solid var(--hud-dim); }
+  button { background: transparent; color: var(--hud); border: 1px solid var(--hud); padding: 8px 14px; font: inherit; letter-spacing: 0.1em; cursor: pointer; }
+  button:hover { background: var(--hud); color: #000; }
+  label { color: var(--hud-dim); font-size: 0.85rem; display: flex; align-items: center; gap: 8px; }
+  input[type=range] { accent-color: var(--hud); width: 180px; }
+  #log { flex: 1; min-width: 200px; color: var(--hud-dim); font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 320px 220px 220px; }
+    #radarPanel { grid-row: auto; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>VISION<span>AIRY</span> · XRAY</h1>
+  <div class="stat">LINK <b id="sLink" class="bad">NO ESP32</b></div>
+  <div class="stat">RSSI <b id="sRssi">--</b></div>
+  <div class="stat">FRAMES/S <b id="sPps">--</b></div>
+  <div class="stat">TURBULENCE <b id="sTurb">--</b></div>
+  <div class="stat">SCORE <b id="sScore">--</b></div>
+</header>
+
+<main>
+  <section class="panel" id="radarPanel">
+    <h2>CONTACT</h2>
+    <canvas id="radar"></canvas>
+    <div id="verdict">WAITING<small>connect the ESP32</small></div>
+  </section>
+  <section class="panel">
+    <h2>MOTION SCORE · ×BASELINE · LAST 30 S</h2>
+    <canvas id="chart"></canvas>
+  </section>
+  <section class="panel">
+    <h2>CSI WATERFALL · 51 SUBCARRIERS</h2>
+    <canvas id="waterfall"></canvas>
+  </section>
+</main>
+
+<footer>
+  <button id="btnCal">RECALIBRATE (C)</button>
+  <label>THRESHOLD <input id="thresh" type="range" min="1.2" max="8" step="0.1" value="2"> <b id="threshVal">2.0×</b></label>
+  <div id="log">…</div>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const HUD = '#39ff6a', DIM = '#1c7a35', ALERT = '#ff3b3b';
+
+const state = {
+  connected: false, rssi: null, pps: 0, turb: 0, score: 0, present: false, cal: true, thresh: 2,
+  history: [], // {t, score, present}
+  lastFrame: null,
+};
+
+// ---------- WebSocket ----------
+let ws;
+function connectWs() {
+  ws = new WebSocket(`ws://${location.host}`);
+  ws.onmessage = (e) => handle(e.data);
+  ws.onclose = () => { setLink(false, 'NO SERVER'); setTimeout(connectWs, 1000); };
+}
+connectWs();
+const send = (cmd) => ws && ws.readyState === 1 && ws.send(cmd);
+
+function setLink(ok, text) {
+  state.connected = ok;
+  $('sLink').textContent = text;
+  $('sLink').className = ok ? '' : 'bad';
+}
+
+function handle(line) {
+  const kind = line[0];
+  if (kind === 'C') {
+    const [, rssi, hex] = line.split(' ');
+    if (!hex) return;
+    const amp = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < amp.length; i++) amp[i] = parseInt(hex.substr(i * 2, 2), 16);
+    state.rssi = +rssi;
+    pushWaterfall(amp);
+  } else if (kind === 'M') {
+    const [, turb, score, present, pps, cal, thresh] = line.split(' ');
+    Object.assign(state, { turb: +turb, score: +score, present: present === '1', pps: +pps, cal: cal === '1' });
+    if (!dragging) { state.thresh = +thresh; $('thresh').value = thresh; $('threshVal').textContent = (+thresh).toFixed(1) + '×'; }
+    state.history.push({ t: performance.now(), score: state.score, present: state.present, cal: state.cal });
+    const cutoff = performance.now() - 30000;
+    while (state.history.length && state.history[0].t < cutoff) state.history.shift();
+    lastM = performance.now();
+    updateStats();
+  } else if (kind === 'S') {
+    $('log').textContent = line.slice(2);
+  } else if (kind === 'P') {
+    setLink(line !== 'P -', line === 'P -' ? 'NO ESP32' : 'USB');
+  }
+}
+
+let lastM = 0;
+function updateStats() {
+  const wifiUp = state.pps > 0;
+  setLink(true, wifiUp ? 'LIVE' : 'NO WIFI FRAMES');
+  if (!wifiUp) $('sLink').className = 'bad';
+  $('sRssi').textContent = state.rssi == null ? '--' : `${state.rssi} dBm`;
+  $('sPps').textContent = state.pps;
+  $('sPps').className = state.pps < 30 ? 'bad' : '';
+  $('sTurb').textContent = state.turb.toFixed(4);
+  $('sScore').textContent = state.cal ? 'CAL…' : state.score.toFixed(2) + '×';
+
+  const v = $('verdict');
+  if (!wifiUp) { v.className = ''; v.innerHTML = 'NO SIGNAL<small>is the hotspot on with Maximize Compatibility?</small>'; }
+  else if (state.cal) { v.className = ''; v.innerHTML = 'CALIBRATING<small>keep the path clear</small>'; }
+  else if (state.present) { v.className = 'alert'; v.innerHTML = 'CONTACT<small>motion behind the wall</small>'; }
+  else { v.className = ''; v.innerHTML = 'CLEAR<small>no motion</small>'; }
+}
+
+// ---------- Controls ----------
+let dragging = false;
+$('btnCal').onclick = () => send('c');
+window.addEventListener('keydown', (e) => { if (e.key === 'c' || e.key === 'C') send('c'); });
+$('thresh').addEventListener('input', (e) => { dragging = true; $('threshVal').textContent = (+e.target.value).toFixed(1) + '×'; });
+$('thresh').addEventListener('change', (e) => { send('t' + e.target.value); dragging = false; });
+
+// ---------- Canvas helpers ----------
+function fit(canvas) {
+  const r = canvas.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; return true; }
+  return false;
+}
+
+// ---------- Waterfall: newest frame on the right, subcarriers top-to-bottom ----------
+const wf = $('waterfall'), wfCtx = wf.getContext('2d');
+const wfBuf = document.createElement('canvas'), wfBufCtx = wfBuf.getContext('2d');
+let wfCol = null;
+function pushWaterfall(amp) {
+  const n = amp.length;
+  if (wfBuf.height !== n) { wfBuf.width = 600; wfBuf.height = n; wfCol = wfBufCtx.createImageData(1, n); }
+  // Normalise per frame so gain changes don't wash out the picture, like the firmware does.
+  let mean = 0; for (const a of amp) mean += a; mean /= n || 1;
+  for (let i = 0; i < n; i++) {
+    const x = Math.min(1, (amp[i] / (mean || 1)) / 2);
+    const o = i * 4;
+    wfCol.data[o] = state.present ? 255 * x : 40 * x;
+    wfCol.data[o + 1] = state.present ? 80 * x : 255 * x;
+    wfCol.data[o + 2] = state.present ? 60 * x : 106 * x;
+    wfCol.data[o + 3] = 255;
+  }
+  wfBufCtx.drawImage(wfBuf, -1, 0);
+  wfBufCtx.putImageData(wfCol, wfBuf.width - 1, 0);
+  state.lastFrame = amp;
+}
+function drawWaterfall() {
+  fit(wf);
+  wfCtx.imageSmoothingEnabled = false;
+  wfCtx.fillStyle = '#000'; wfCtx.fillRect(0, 0, wf.width, wf.height);
+  if (wfBuf.width) wfCtx.drawImage(wfBuf, 0, 0, wf.width, wf.height);
+}
+
+// ---------- Score chart ----------
+const ch = $('chart'), chCtx = ch.getContext('2d');
+function drawChart() {
+  fit(ch);
+  const W = ch.width, H = ch.height, dpr = devicePixelRatio || 1, padT = 24 * dpr, padB = 8 * dpr;
+  chCtx.clearRect(0, 0, W, H);
+  const maxY = Math.max(state.thresh * 2, ...state.history.map((p) => p.score), 2);
+  const y = (v) => H - padB - (v / maxY) * (H - padT - padB);
+  const now = performance.now();
+  const x = (t) => W - ((now - t) / 30000) * W;
+
+  chCtx.font = `${10 * dpr}px Menlo, monospace`;
+  chCtx.fillStyle = DIM; chCtx.strokeStyle = 'rgba(57,255,106,0.12)'; chCtx.lineWidth = 1;
+  for (let v = 0; v <= maxY; v += maxY > 10 ? 5 : 1) {
+    chCtx.beginPath(); chCtx.moveTo(0, y(v)); chCtx.lineTo(W, y(v)); chCtx.stroke();
+    chCtx.fillText(v + '×', W - 30 * dpr, y(v) - 3 * dpr);
+  }
+  // Shade where the ESP32 said "present".
+  chCtx.fillStyle = 'rgba(255,59,59,0.15)';
+  for (let i = 1; i < state.history.length; i++) {
+    const a = state.history[i - 1], b = state.history[i];
+    if (b.present) chCtx.fillRect(x(a.t), padT, x(b.t) - x(a.t) + 1, H - padT - padB);
+  }
+  chCtx.setLineDash([6 * dpr, 4 * dpr]); chCtx.strokeStyle = ALERT;
+  chCtx.beginPath(); chCtx.moveTo(0, y(state.thresh)); chCtx.lineTo(W, y(state.thresh)); chCtx.stroke();
+  chCtx.setLineDash([]);
+  chCtx.strokeStyle = HUD; chCtx.lineWidth = 2 * dpr; chCtx.beginPath();
+  let started = false;
+  for (const p of state.history) {
+    if (p.cal) { started = false; continue; }
+    started ? chCtx.lineTo(x(p.t), y(p.score)) : chCtx.moveTo(x(p.t), y(p.score));
+    started = true;
+  }
+  chCtx.stroke();
+}
+
+// ---------- Radar ----------
+const rd = $('radar'), rdCtx = rd.getContext('2d');
+const pings = [];
+let lastPing = 0, sweep = 0;
+function drawRadar(dt) {
+  fit(rd);
+  const W = rd.width, H = rd.height, dpr = devicePixelRatio || 1;
+  const cx = W / 2, cy = H * 0.45, R = Math.min(W, H) * 0.36;
+  rdCtx.fillStyle = 'rgba(4,17,10,0.35)'; rdCtx.fillRect(0, 0, W, H);
+
+  rdCtx.strokeStyle = 'rgba(57,255,106,0.25)'; rdCtx.lineWidth = 1 * dpr;
+  for (let i = 1; i <= 4; i++) { rdCtx.beginPath(); rdCtx.arc(cx, cy, (R * i) / 4, 0, Math.PI * 2); rdCtx.stroke(); }
+  rdCtx.beginPath(); rdCtx.moveTo(cx - R, cy); rdCtx.lineTo(cx + R, cy); rdCtx.moveTo(cx, cy - R); rdCtx.lineTo(cx, cy + R); rdCtx.stroke();
+
+  sweep += dt * 0.0025;
+  const g = rdCtx.createConicGradient ? rdCtx.createConicGradient(sweep - 0.6, cx, cy) : null;
+  if (g) {
+    g.addColorStop(0, 'rgba(57,255,106,0)'); g.addColorStop(0.1, 'rgba(57,255,106,0.22)'); g.addColorStop(0.1001, 'rgba(57,255,106,0)');
+    rdCtx.fillStyle = g; rdCtx.beginPath(); rdCtx.arc(cx, cy, R, 0, Math.PI * 2); rdCtx.fill();
+  }
+
+  // A single Wi-Fi link can't tell direction, so intensity = how big and how often the rings pulse.
+  const live = !state.cal && state.pps > 0;
+  const level = live ? Math.min(1, Math.max(0, (state.score - 1) / Math.max(0.1, state.thresh * 1.5 - 1))) : 0;
+  const now = performance.now();
+  const interval = state.present ? 450 : 1400 - level * 800;
+  if (live && level > 0.05 && now - lastPing > interval) {
+    pings.push({ born: now, alert: state.present, size: 0.35 + level * 0.65 });
+    lastPing = now;
+  }
+  for (let i = pings.length - 1; i >= 0; i--) {
+    const p = pings[i], age = (now - p.born) / 1600;
+    if (age > 1) { pings.splice(i, 1); continue; }
+    rdCtx.strokeStyle = p.alert ? `rgba(255,59,59,${1 - age})` : `rgba(57,255,106,${(1 - age) * 0.8})`;
+    rdCtx.lineWidth = (p.alert ? 4 : 2) * dpr;
+    rdCtx.beginPath(); rdCtx.arc(cx, cy, R * p.size * age, 0, Math.PI * 2); rdCtx.stroke();
+  }
+  // Core blob grows with the score.
+  rdCtx.fillStyle = state.present ? ALERT : HUD;
+  rdCtx.shadowColor = rdCtx.fillStyle; rdCtx.shadowBlur = 20 * dpr * (0.3 + level);
+  rdCtx.beginPath(); rdCtx.arc(cx, cy, (4 + level * 18) * dpr, 0, Math.PI * 2); rdCtx.fill();
+  rdCtx.shadowBlur = 0;
+
+  // Level bar under the scope.
+  const bw = R * 2, bx = cx - R, by = cy + R + 16 * dpr, bh = 8 * dpr;
+  rdCtx.strokeStyle = DIM; rdCtx.strokeRect(bx, by, bw, bh);
+  rdCtx.fillStyle = state.present ? ALERT : HUD; rdCtx.fillRect(bx, by, bw * level, bh);
+}
+
+let lastT = performance.now();
+function frame(t) {
+  const dt = t - lastT; lastT = t;
+  if (state.connected && t - lastM > 3000) { state.pps = 0; updateStats(); setLink(false, 'ESP32 SILENT'); }
+  drawRadar(dt); drawChart(); drawWaterfall();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
