@@ -1,0 +1,20 @@
+:root {
+  --hud: #39ff6a;
+  --hud-dim: #1c7a35;
+  --bg: #000;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--hud); font-family: ui-monospace, Menlo, monospace; }
+
+body.menu { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; padding: 16px; text-align: center; }
+h1 { letter-spacing: 0.3em; margin: 0; font-size: 2rem; }
+h1 span { color: #fff; }
+.sub { color: var(--hud-dim); margin: 0 0 12px; }
+a.big { display: block; width: min(420px, 100%); padding: 22px; border: 2px solid var(--hud); color: var(--hud); text-decoration: none; font-size: 1.4rem; letter-spacing: 0.15em; }
+a.big small { display: block; font-size: 0.75rem; color: var(--hud-dim); margin-top: 6px; letter-spacing: 0.05em; }
+
+button { background: transparent; color: var(--hud); border: 2px solid var(--hud); padding: 12px 18px; font: inherit; letter-spacing: 0.1em; }
+button:active { background: var(--hud); color: #000; }
+label { display: block; margin: 10px 0 4px; color: var(--hud-dim); }
+input[type=range] { width: 100%; accent-color: var(--hud); }
+input[type=text], select { width: 100%; background: #000; color: var(--hud); border: 1px solid var(--hud-dim); padding: 8px; font: inherit; }

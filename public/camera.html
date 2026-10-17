@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VisionAiry Camera</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    body { padding: 16px; max-width: 520px; margin: 0 auto; }
+    video { width: 100%; border: 1px solid var(--hud-dim); background: #111; }
+    .row { display: flex; gap: 10px; margin-top: 14px; }
+    .row > * { flex: 1; }
+    #status { margin-top: 10px; color: var(--hud-dim); }
+    .val { color: #fff; float: right; }
+    .hint { color: var(--hud-dim); font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <h2 id="title">ROOM CAMERA</h2>
+  <video id="video" autoplay playsinline muted></video>
+
+  <label>Name</label>
+  <input id="name" type="text" placeholder="e.g. FLOOR, LEFT WING" />
+
+  <label>Lens</label>
+  <select id="facing">
+    <option value="environment">Back camera</option>
+    <option value="user">Front camera</option>
+  </select>
+
+  <label>Heading <span class="val" id="headingVal">0°</span></label>
+  <input id="heading" type="range" min="0" max="359" value="0" />
+  <div class="hint">Which way the lens points. 0° = straight ahead of the pilot, 90° = pilot's right, 180° = behind.</div>
+
+  <label>Pitch <span class="val" id="pitchVal">0°</span></label>
+  <input id="pitch" type="range" min="-90" max="90" value="0" />
+  <div class="hint">-90° = pointing at the floor (the "look through the jet" camera), +90° = ceiling.</div>
+
+  <label>Field of view <span class="val" id="fovVal">60°</span></label>
+  <input id="fov" type="range" min="30" max="120" value="60" />
+
+  <div class="row">
+    <button id="start">START STREAM</button>
+  </div>
+  <div id="status">idle</div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const video = $('video');
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const FPS = 15;
+    const WIDTH = 640; // frames are downscaled to this width before sending
+
+    let ws, stream, slot = null, sent = 0, timer;
+
+    // Persist settings so a refresh doesn't lose calibration
+    for (const id of ['name', 'heading', 'pitch', 'fov', 'facing']) {
+      const saved = localStorage.getItem('cam.' + id);
+      if (saved !== null) $(id).value = saved;
+      $(id).addEventListener('input', () => {
+        localStorage.setItem('cam.' + id, $(id).value);
+        updateLabels();
+        sendInfo();
+      });
+    }
+    $('facing').addEventListener('change', () => stream && startCamera());
+
+    function updateLabels() {
+      $('headingVal').textContent = $('heading').value + '°';
+      $('pitchVal').textContent = $('pitch').value + '°';
+      $('fovVal').textContent = $('fov').value + '°';
+    }
+    updateLabels();
+
+    function info() {
+      return {
+        name: $('name').value.trim() || (slot !== null ? `CAM ${slot + 1}` : 'CAM'),
+        heading: +$('heading').value,
+        pitch: +$('pitch').value,
+        fov: +$('fov').value,
+      };
+    }
+
+    function sendInfo() {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'info', info: info() }));
+    }
+
+    async function startCamera() {
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: $('facing').value, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+    }
+
+    function connect() {
+      ws = new WebSocket(`wss://${location.host}/ws?role=camera`);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => { $('status').textContent = 'connected'; };
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'slot') {
+          slot = msg.slot;
+          $('title').textContent = `ROOM CAMERA // SLOT ${slot + 1}`;
+          sendInfo();
+        }
+      };
+      ws.onclose = () => {
+        $('status').textContent = 'disconnected — retrying…';
+        setTimeout(connect, 1000);
+      };
+    }
+
+    function pump() {
+      if (!ws || ws.readyState !== 1 || !video.videoWidth) return;
+      if (ws.bufferedAmount > 256 * 1024) return; // network is behind, skip this frame
+      canvas.width = WIDTH;
+      canvas.height = Math.round((WIDTH * video.videoHeight) / video.videoWidth);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => {
+        if (blob && ws.readyState === 1) {
+          ws.send(blob);
+          sent++;
+        }
+      }, 'image/jpeg', 0.6);
+    }
+
+    setInterval(() => {
+      if (stream) $('status').textContent = `streaming ${sent} fps · slot ${slot === null ? '?' : slot + 1}`;
+      sent = 0;
+    }, 1000);
+
+    $('start').onclick = async () => {
+      try {
+        await startCamera();
+        if (!ws) connect();
+        clearInterval(timer);
+        timer = setInterval(pump, 1000 / FPS);
+        $('start').textContent = 'STREAMING';
+        // Keep the screen on so the phone doesn't sleep mid-demo
+        navigator.wakeLock?.request('screen').catch(() => {});
+      } catch (err) {
+        $('status').textContent = 'camera error: ' + err.message;
+      }
+    };
+  </script>
+</body>
+</html>

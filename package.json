@@ -1,0 +1,13 @@
+{
+  "name": "visionairy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DIY F-35 style see-through helmet: room cameras + phone-in-cardboard headset",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>VisionAiry Headset</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    html, body { overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; }
+    canvas#screen { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+    #setup { position: fixed; inset: 0; background: #000; overflow-y: auto; padding: 16px; z-index: 2; }
+    #setup .inner { max-width: 520px; margin: 0 auto; }
+    #setup h2 { letter-spacing: 0.2em; }
+    .val { color: #fff; float: right; }
+    .check { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+    .check input { width: 22px; height: 22px; accent-color: var(--hud); }
+    #go { width: 100%; margin-top: 20px; font-size: 1.3rem; padding: 18px; }
+    .hint { color: var(--hud-dim); font-size: 0.8rem; line-height: 1.5; }
+    #err { color: #ff5a5a; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <canvas id="screen"></canvas>
+
+  <div id="setup">
+    <div class="inner">
+      <h2>HEADSET // PREFLIGHT</h2>
+
+      <div class="check"><input type="checkbox" id="stereo" checked /><label for="stereo">Split-screen for cardboard lenses</label></div>
+
+      <label>Field of view <span class="val" id="fovVal">90°</span></label>
+      <input id="fov" type="range" min="50" max="120" value="90" />
+
+      <label>Eye spacing <span class="val" id="ipdVal">0</span></label>
+      <input id="ipd" type="range" min="-80" max="80" value="0" />
+      <div class="hint">Nudge until both images line up into one through the lenses.</div>
+
+      <label>Phone camera FOV <span class="val" id="passFovVal">65°</span></label>
+      <input id="passFov" type="range" min="40" max="100" value="65" />
+      <div class="hint">How wide the headset phone's own camera is. Used to keep the X-ray hand fill lined up when you turn your head.</div>
+
+      <button id="go">ENGAGE</button>
+      <div id="err"></div>
+
+      <p class="hint">
+        In the headset: <b>tap</b> the screen (or cardboard button) to switch mode ·
+        <b>hold</b> to recenter (look straight ahead first).<br />
+        On a laptop: drag to look, keys <b>1/2/3</b> for modes, <b>R</b> to recenter.<br />
+        Modes: <b>XRAY</b> see through your hands · <b>DAS</b> room cameras only · <b>PASS</b> plain camera.
+      </p>
+    </div>
+  </div>
+
+  <script type="module" src="headset.js"></script>
+</body>
+</html>
