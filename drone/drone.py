@@ -9,7 +9,7 @@ Keys (in the video window) – hold a movement key to push harder, let go to sto
   W/S forward/back   A/D left/right   UP/DOWN (or R/F) up/down
   T take off   L land   SPACE motors off   C gyro calibrate (on the ground)
   SHIFT + W/A/S/D/R/F nudge trim   K auto-trim on/off   BACKSPACE reset trim
-  P photo   V start/stop recording   H hide key map   ESC quit
+  P photo   V start/stop recording   O object boxes on/off   H hide key map   ESC quit
   CLICK the video to fly there, same height (see target.py)   RIGHT-CLICK or a movement key cancels
   SPEED 1/2/3: click the buttons in the window (no key)
 Photos and recordings go to the media/ folder next to this script.
@@ -18,6 +18,11 @@ Drift: while no movement keys are held the video is used to measure which way th
 sliding, and auto-trim offsets the sticks to cancel it (see drift.py). Every time you let go it
 auto-calibrates for a few seconds with faster correction, then holds. Trims are saved
 to trim.json and reused next time.
+
+Objects: humans, chairs, tables, TVs, bags, boxes, windows, doors and walls are boxed, named and
+tracked with an ID (a small YOLOX model, downloaded once into models/, plus shape rules); anything
+else is only shown while it's in the way, as "obstacle". Anything in the flight path that is close or closing in fast turns red with an
+OBSTACLE AHEAD warning (see obstacles.py). It only warns - it never steers the drone.
 
 Needs: pip install opencv-python numpy
 """
@@ -42,6 +47,7 @@ try:
     import numpy as np
     import drift
     import hud
+    import obstacles
     import target
 except ImportError:
     cv2 = None
@@ -64,7 +70,7 @@ TRIM_KEYS = {ord("W"): ("y", 1), ord("S"): ("y", -1), ord("D"): ("x", 1), ord("A
              ord("R"): ("z", 1), ord("F"): ("z", -1)}      # SHIFT gives the capital letter
 
 # key name -> (OpenCV waitKey code, Windows virtual-key code)
-KEY_CODES = {c: (ord(c), ord(c.upper())) for c in "wasdrftlpvhck"}
+KEY_CODES = {c: (ord(c), ord(c.upper())) for c in "wasdrftlpvhcko"}
 KEY_CODES.update(space=(32, 0x20), esc=(27, 0x1B), up=(None, 0x26), down=(None, 0x28),
                  shift=(None, 0x10), back=(8, 0x08))
 
@@ -209,9 +215,10 @@ class Pilot:
 
 
 class Link:
-    def __init__(self, variant, fly, save_dir, verbose, camera="forward", autotrim=True):
+    def __init__(self, variant, fly, save_dir, verbose, camera="forward", autotrim=True, objects=True,
+                 model="tiny"):
         self.variant, self.fly, self.save_dir, self.verbose = variant, fly, save_dir, verbose
-        self.camera, self.autotrim = camera, autotrim
+        self.camera, self.autotrim, self.objects, self.model = camera, autotrim, objects, model
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 0))
         self.sock.settimeout(0.005)
@@ -383,6 +390,8 @@ class Link:
         saved_trim = self.pilot.trims()
         last_input = last_drift_log = 0.0
         goto = target.ClickTarget(self.camera)
+        obs = obstacles.ObstacleTracker(self.camera, self.model, self.log)
+        obs.enabled = self.objects
         clicks = []                     # (button, canvas x, canvas y) from the mouse callback
 
         def on_mouse(event, x, y, flags, param):
@@ -412,6 +421,7 @@ class Link:
                     img = decoded
                     est.update(img, now)
                     goto.update(img, now)
+                    obs.update(img, now)
                     if writer:
                         writer.write(img if img.shape[1::-1] == rec_size else cv2.resize(img, rec_size))
 
@@ -506,6 +516,8 @@ class Link:
                 "drift_text": drift.describe(est.vel), "auto": auto.state,
                 "goto": goto.norm() if goto.active and img is not None else None,
                 "frame_shape": None if img is None else img.shape, "speed": self.pilot.speed,
+                "objects": obs.objects() if obs.enabled and img is not None else None,
+                "model": obs.model_status,
                 "toasts": [m for m, _ in reversed(toasts)],
             }
             canvas = hud.fit(img)
@@ -563,6 +575,9 @@ class Link:
                     toast("no video yet")
             elif k == ord("h"):
                 show_keys = not show_keys
+            elif k == ord("o"):
+                obs.enabled = not obs.enabled
+                toast("object tracking " + ("on" if obs.enabled else "off"))
             if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:   # closed with the X
                 self.running = False
         if writer:
@@ -581,6 +596,9 @@ def main():
     ap.add_argument("--camera", choices=["forward", "down"], default="forward",
                     help="which way the drone's camera points (for drift detection)")
     ap.add_argument("--no-autotrim", action="store_true", help="start with auto-trim off (K toggles)")
+    ap.add_argument("--no-objects", action="store_true", help="start with object tracking off (O toggles)")
+    ap.add_argument("--model", choices=["tiny", "nano", "off"], default="tiny",
+                    help="object-naming model: tiny (default), nano (faster CPUs), off (unnamed boxes)")
     args = ap.parse_args()
 
     variant = args.variant or detect_variant()
@@ -593,7 +611,8 @@ def main():
     if fly and cv2 is None:
         sys.exit("Flying needs OpenCV for the video window: pip install opencv-python numpy")
 
-    link = Link(variant, fly, args.save, args.verbose, args.camera, not args.no_autotrim)
+    link = Link(variant, fly, args.save, args.verbose, args.camera, not args.no_autotrim, not args.no_objects,
+                None if args.model == "off" else args.model)
     link.log(f"variant {variant.upper()} – {'A: 192.168.1.1' if variant == 'a' else 'B: 192.168.169.1:8800'}")
     if fly:
         link.log("click the video window, then:", HELP)

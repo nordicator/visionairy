@@ -79,6 +79,35 @@ def goto_marker(img, st):
     text(img, "GO TO", (p[0], p[1] - r - 6), ACCENT, 0.45, 1, "c")
 
 
+def object_boxes(img, st):
+    """Corner brackets on each tracked object: green, yellow when closing in, red for a threat."""
+    x, y, nw, nh = letterbox(st["frame_shape"])
+    threat = False
+    tags = []
+    # threats last, so their brackets and names end up on top
+    for o in sorted(st["objects"], key=lambda o: (o["threat"], o["ttc"] is not None)):
+        x0, y0, x1, y1 = (round(x + o["box"][0] * nw), round(y + o["box"][1] * nh),
+                          round(x + o["box"][2] * nw), round(y + o["box"][3] * nh))
+        color = RED if o["threat"] else YELLOW if o["ttc"] else GREEN
+        if o["lost"]:
+            color = GREY
+        threat |= o["threat"]
+        c = max(6, min(x1 - x0, y1 - y0) // 4)              # bracket arm length
+        for px, py, dx, dy in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
+            cv2.line(img, (px, py), (px + c * dx, py), color, 2, cv2.LINE_AA)
+            cv2.line(img, (px, py), (px, py + c * dy), color, 2, cv2.LINE_AA)
+        tags.append((o, x0, y0, color))
+    for o, x0, y0, color in tags:                           # names over every bracket
+        label = f"{o['label'].upper()} #{o['id']}" + (f"  {o['ttc']:.1f}s" if o["ttc"] else "")
+        (tw, th), _ = cv2.getTextSize(label, FONT, 0.5, 1)
+        ty = max(y0 - 6, 50)                                # baseline, kept below the top bar
+        tx = max(0, min(x0, W - tw - 8))
+        panel(img, tx, ty - th - 5, min(W, tx + tw + 8), ty + 5, 0.7)
+        text(img, label, (tx + 4, ty), color, 0.5)
+    if threat and int(st["t"] * 4) % 2:
+        boxed(img, "OBSTACLE AHEAD", (W // 2, 104), RED, 0.7, 2)
+
+
 def panel(img, x0, y0, x1, y1, alpha=0.6):
     roi = img[y0:y1, x0:x1]
     roi[:] = (roi * (1 - alpha)).astype(np.uint8)
@@ -155,6 +184,10 @@ def top_bar(img, st):
     if st["res"]:
         items.append((st["res"], GREY))
     items.append((f"{st['fps']:.0f} fps", GREY))
+    if st["objects"] is not None:
+        model, ok = st["model"]
+        items.append((model, GREY if ok else YELLOW))
+        items.append((f"{len(st['objects'])} OBJ", GREY))
     if st["flight"] is not None:
         m, s = divmod(int(st["flight"]), 60)
         items.append((f"FLIGHT {m:02d}:{s:02d}", WHITE))
@@ -177,7 +210,7 @@ def keys_panel(img, st):
     k, g = 38, 5
     rows_h = (2 * k + g + 24 + 36 + 32 + 20) if st["fly"] else 0
     x0, y0 = 12, H - 12 - (rows_h + 50)
-    panel(img, x0, y0, x0 + 356, H - 12)
+    panel(img, x0, y0, x0 + 430, H - 12)
     x, y = x0 + 12, y0 + 12
     if st["fly"]:
         keycap(img, x + k + g, y, k, k, "W", "w" in p)
@@ -208,7 +241,8 @@ def keys_panel(img, st):
         y += 20
     cx = x
     for key, name, cap, w in (("p", "P", "PHOTO", 72), ("v", "V", "REC", 58),
-                              ("h", "H", "HIDE", 64), ("back", "BKSP", "TRIM 0", 90)):
+                              ("h", "H", "HIDE", 64), ("o", "O", "OBJECTS", 96),
+                              ("back", "BKSP", "TRIM 0", 90)):
         keycap(img, cx, y, w, 26, name, key in p, cap)
         cx += w + 6
 
@@ -295,6 +329,8 @@ def draw(img, st):
         text(img, f"CONNECTING TO DRONE{dots}", (W // 2 - 150, H // 2 - 40), WHITE, 0.8, 2)
         text(img, "join the drone's Wi-Fi if you haven't", (W // 2, H // 2 - 12), GREY, 0.5, 1, "c")
     top_bar(img, st)
+    if st["objects"]:
+        object_boxes(img, st)
     if st["goto"]:
         goto_marker(img, st)
     if st["fly"]:
