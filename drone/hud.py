@@ -15,6 +15,15 @@ ACCENT = (0, 200, 255)       # amber (BGR)
 GREEN = (90, 220, 90)
 YELLOW = (0, 220, 255)
 RED = (70, 70, 240)
+# one colour per kind of object (BGR). Red and yellow are kept for warnings, so none use them.
+OBJECT_COLORS = {"human": (255, 90, 255),     # magenta
+                 "chair": (255, 190, 40),     # sky blue
+                 "table": (90, 220, 90),      # green
+                 "tv": (255, 140, 190),       # purple
+                 "bag": (0, 150, 255),        # orange
+                 "box": (120, 190, 220),      # tan
+                 "wall": (215, 215, 215),     # light grey
+                 "obstacle": RED}
 
 ACTION_STYLE = {1: ("TAKING OFF", GREEN), 2: ("LANDING", YELLOW), 4: ("MOTORS OFF", RED),
                 0x80: ("CALIBRATING GYRO", YELLOW)}
@@ -79,33 +88,62 @@ def goto_marker(img, st):
     text(img, "GO TO", (p[0], p[1] - r - 6), ACCENT, 0.45, 1, "c")
 
 
+def object_color(label):
+    return OBJECT_COLORS.get(label, WHITE)
+
+
+def dim(color, k=0.55):
+    return tuple(round(c * k) for c in color)
+
+
 def object_boxes(img, st):
-    """Corner brackets on each tracked object: green, yellow when closing in, red for a threat."""
+    """Corner brackets on each tracked object in its type's colour. A threat gets thick red
+    brackets; closing in shows seconds-to-contact in yellow; briefly lost = thin and dim."""
     x, y, nw, nh = letterbox(st["frame_shape"])
+    object_legend(img, st)                                  # first, so name tags stay on top
     threat = False
     tags = []
     # threats last, so their brackets and names end up on top
     for o in sorted(st["objects"], key=lambda o: (o["threat"], o["ttc"] is not None)):
         x0, y0, x1, y1 = (round(x + o["box"][0] * nw), round(y + o["box"][1] * nh),
                           round(x + o["box"][2] * nw), round(y + o["box"][3] * nh))
-        color = RED if o["threat"] else YELLOW if o["ttc"] else GREEN
-        if o["lost"]:
-            color = GREY
+        color, thick = object_color(o["label"]), 2
+        if o["threat"]:
+            color, thick = RED, 3
+        elif o["lost"]:
+            color, thick = dim(color), 1
         threat |= o["threat"]
         c = max(6, min(x1 - x0, y1 - y0) // 4)              # bracket arm length
         for px, py, dx, dy in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
-            cv2.line(img, (px, py), (px + c * dx, py), color, 2, cv2.LINE_AA)
-            cv2.line(img, (px, py), (px, py + c * dy), color, 2, cv2.LINE_AA)
+            cv2.line(img, (px, py), (px + c * dx, py), color, thick, cv2.LINE_AA)
+            cv2.line(img, (px, py), (px, py + c * dy), color, thick, cv2.LINE_AA)
         tags.append((o, x0, y0, color))
     for o, x0, y0, color in tags:                           # names over every bracket
-        label = f"{o['label'].upper()} #{o['id']}" + (f"  {o['ttc']:.1f}s" if o["ttc"] else "")
-        (tw, th), _ = cv2.getTextSize(label, FONT, 0.5, 1)
+        name = f"{o['label'].upper()} #{o['id']}"
+        ttc = f"  {o['ttc']:.1f}s" if o["ttc"] else ""
+        (tw, th), _ = cv2.getTextSize(name + ttc, FONT, 0.5, 1)
         ty = max(y0 - 6, 50)                                # baseline, kept below the top bar
         tx = max(0, min(x0, W - tw - 8))
         panel(img, tx, ty - th - 5, min(W, tx + tw + 8), ty + 5, 0.7)
-        text(img, label, (tx + 4, ty), color, 0.5)
+        cv2.rectangle(img, (tx, ty - th - 5), (tx + 2, ty + 5), color, -1)   # colour chip
+        nx = tx + 6 + text(img, name, (tx + 6, ty), color, 0.5)
+        if ttc:
+            text(img, ttc, (nx, ty), RED if o["threat"] else YELLOW, 0.5)
     if threat and int(st["t"] * 4) % 2:
         boxed(img, "OBSTACLE AHEAD", (W // 2, 104), RED, 0.7, 2)
+
+
+def object_legend(img, st):
+    """Colour key for the kinds of object on screen right now, under the speed buttons."""
+    kinds = sorted({o["label"] for o in st["objects"]}, key=list(OBJECT_COLORS).index)
+    if not kinds:
+        return
+    x0, y0 = 12, 84 if st["fly"] else 40
+    panel(img, x0, y0, x0 + 110, y0 + 10 + 18 * len(kinds))
+    for i, kind in enumerate(kinds):
+        cy = y0 + 14 + 18 * i
+        cv2.circle(img, (x0 + 14, cy), 5, object_color(kind), -1, cv2.LINE_AA)
+        text(img, kind.upper(), (x0 + 26, cy + 5), WHITE, 0.42)
 
 
 def panel(img, x0, y0, x1, y1, alpha=0.6):

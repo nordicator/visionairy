@@ -1,29 +1,83 @@
 # dronekit – open client for Sky Rider Cruise / cooingdv Wi-Fi drones
 
-Standalone Python tool inside VisionAiry. It doesn't use the Node server; run it from this folder (`cd drone`).
+A standalone Python tool inside VisionAiry. It flies a cheap Wi-Fi toy drone from your laptop instead of the phone app, and adds computer vision on top of the video. It doesn't use the Node server; run everything from this folder (`cd drone`).
 
-- `PROTOCOL.md` – full protocol spec (both hardware variants)
-- `protocol.py` – packet builders/parsers + Variant-B video reassembler
-- `jpeg_header.py` – regenerates the JPEG headers Variant-B frames need
-- `drone.py` – test client (video + keyboard flight)
-- `drift.py` – drift detection and auto-trim from the video
-- `target.py` – click-to-go tracking and steering
-- `obstacles.py` – finds, names and tracks objects / obstacles in the video
-- `detector.py` – the object-naming model (YOLOX via OpenCV DNN, downloaded once into `models/`)
-- `test_sim.py` – self-test against simulated drones (no hardware needed)
+## What it does
+
+- **Live video** from the drone in a window with a heads-up display: connection status, Wi-Fi signal, latency, fps, flight timer, stick positions and drift.
+- **Keyboard flight**: take off, land, emergency stop, move, climb and descend, with three speed modes like the phone app.
+- **Auto-trim**: watches the video to see which way the drone drifts on its own and trims it out. Trims are remembered between flights.
+- **Click to go**: click a spot in the video and the drone flies there at the same height.
+- **Object identification**: boxes, names and tracks **humans, chairs, tables, TVs, bags, boxes and walls** (windows and doors count as walls), each with an ID (`CHAIR #7`). It's built to stay steady while the drone moves.
+- **Obstacle warning**: anything in the flight path that is very close, or that you'll reach in under 2 s, turns red and **OBSTACLE AHEAD** blinks. It only warns; it never steers the drone.
+- **Photos and recording** to `media/`.
+
+It works with both hardware versions of these drones (see [Which drone do I have?](#which-drone-do-i-have)) and finds out which one it's talking to by itself.
+
+What it doesn't do:
+- **No turning (yaw).** The keyboard has no keys for it, so the drone always faces the same way.
+- **No automatic obstacle avoidance.** It only warns you.
+- **No Bluetooth.** The drone only has Wi-Fi.
+
+## Requirements
+
+| What | Notes |
+| --- | --- |
+| Python 3 | tested with 3.14 |
+| `opencv-python` | video window, image processing, and runs the object model. Tested with OpenCV 5.0. |
+| `numpy` | |
+| `pillow` | only for `test_sim.py` |
+| Windows (recommended) | Instant key press and release, and the Wi-Fi signal readout, use Windows APIs. On macOS or Linux it still works, but held keys rely on keyboard auto-repeat and there's no signal readout. |
+| A laptop with Wi-Fi | it joins the drone's own Wi-Fi network |
 
 ```
 pip install opencv-python numpy pillow
-# join the drone's Wi-Fi, then:
-python drone.py                  # video window + flight (same as `python drone.py fly`)
-python drone.py probe            # video + incoming messages, sends NO flight commands
-python drone.py --save frames/   # also save every video frame as JPEG
-python test_sim.py               # offline self-test
 ```
+
+**Object model (about 20 MB):** it's downloaded automatically into `models/` the first time you run it. **The drone's Wi-Fi has no internet**, so do the first run while you're still on your normal internet, for example `python obstacles.py`. Without the model everything still works, but only box and wall get names.
+
+## Quick start
+
+1. `cd drone` and `pip install opencv-python numpy pillow`.
+2. While still on normal internet, run `python obstacles.py` once so the object model downloads. Close it with `ESC`.
+3. Turn the drone on and join its Wi-Fi from your laptop. The name usually starts with `HD-720P-`, `HD-FPV-`, `HD720-` or `FHD-`.
+4. Run `python drone.py`.
+5. Click the video window so it has focus, place the drone on a flat surface, press `C` to calibrate the gyro, then `T` to take off.
+6. Fly with `W A S D` and the up/down arrows. Press `L` to land, or `SPACE` to cut the motors in an emergency.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `python drone.py` | Video window and full flight control (same as `python drone.py fly`) |
+| `python drone.py probe` | Video, HUD and object tracking, but sends **no flight commands**. Safe for testing the connection with the drone on the table. |
+| `python obstacles.py` | Object identification on your **webcam**, no drone needed |
+| `python obstacles.py 1` | Same, on webcam number 1 |
+| `python obstacles.py video.mp4` | Same, on a video file |
+| `python obstacles.py 0 nano` | Webcam with the faster, smaller model (`tiny`, `nano` or `off`) |
+| `python test_sim.py` | Offline self-test against simulated drones. Checks the control packets, video reassembly and both hardware variants. Prints `ALL TESTS PASSED`. |
+
+### Options for `drone.py`
+
+They can be combined, e.g. `python drone.py --camera down --model nano`.
+
+| Option | What it does |
+| --- | --- |
+| `fly` / `probe` | Mode. `fly` is the default; `probe` sends no flight commands. |
+| `--variant a` / `--variant b` | Force the hardware variant instead of detecting it from your IP address |
+| `--camera forward` / `--camera down` | Which way the drone's camera points (default `forward`). Changes how drift and click-to-go read the video. Obstacle warnings only work with `forward`. |
+| `--save DIR` | Also save every video frame as a JPEG into `DIR` |
+| `--no-autotrim` | Start with auto-trim off (`K` toggles it) |
+| `--no-objects` | Start with object tracking off (`O` toggles it) |
+| `--model tiny` | Object model: about 20 MB, about 50 ms per frame, better on small or far things (default) |
+| `--model nano` | Smaller, faster model (about 4 MB, about 25 ms per frame) for slower laptops |
+| `--model off` | No model. Only box and wall are named. |
+| `-v`, `--verbose` | Print every packet sent to the drone |
+| `-h`, `--help` | List all options |
 
 ## Controls
 
-Click the video window first so it has focus; keys typed anywhere else are ignored.
+Click the video window first so it has focus. Keys typed anywhere else are ignored, and the HUD says **CLICK THIS WINDOW TO CONTROL** when it doesn't have focus.
 
 ### Flight
 
@@ -59,41 +113,6 @@ The spot is tracked in the video while the drone moves. It stops when it gets th
 | Left-click on video | Fly to that spot |
 | Right-click | Cancel |
 
-### Objects and obstacles
-
-Only these are named on screen, each with an ID number such as `HUMAN #3`, `CHAIR #7` or `DOOR #2`:
-
-| Name | Found by |
-| --- | --- |
-| human, chair, table, tv, bag (backpack / handbag / suitcase) | a small YOLOX model run by OpenCV (reliable) |
-| box | shape rule: a solid outline with 4–6 corners |
-| window | shape rule: a bright, roughly rectangular area (daylight windows; not at night, and a lamp or white sheet can fool it) |
-| door | shape rule: two tall upright lines a door's width apart with a crossbar on top, reaching toward the floor (a wardrobe can fool it) |
-| wall | shape rule: a big blank area covering the middle of the view |
-
-The model doesn't know boxes, windows, doors or walls, so those four are guesses from shapes and brightness and are less reliable than the model's names. Anything else is still tracked, but only appears while it's in your way, as `OBSTACLE`. A door never triggers the warning, since it's the way through.
-
-The model is downloaded once (about 20 MB) into `models/` the first time you run it. Until then, or with no internet, only box / window / door / wall are named. It runs on its own thread, so a slow PC makes the names update less often but never freezes the video. The top bar shows which model is running and how long it takes per frame.
-
-| Flag | Model |
-| --- | --- |
-| `--model tiny` (default) | ~20 MB, ~50 ms per frame, better on small or far things |
-| `--model nano` | ~4 MB, ~25 ms per frame, for slower PCs |
-| `--model off` | no names, unlabelled boxes only |
-
-Box colours:
-
-| Colour | Meaning |
-| --- | --- |
-| green | tracked, named object |
-| yellow | getting bigger, so you're closing in on it (shows seconds to contact) |
-| red | in the flight path and either very close or under 2 s away: **OBSTACLE AHEAD** blinks |
-| grey | briefly lost, still being predicted |
-
-**Built for a moving drone.** Every frame it measures how the whole picture moved (the drone sliding, turning or flying forward) and moves every box with it, so boxes stay on their objects through fast moves. The model's late answers are carried forward the same way. Frames smeared by a sudden jerk are skipped. A name only appears after a few sightings and doesn't flip once it's settled, and a named object keeps its box and ID for up to 1.5 s if it's briefly missed (behind something, or blurred).
-
-It only warns and never steers the drone. A blank wall filling the whole view isn't an "object", so watch the drift panel's zoom for that case. Turn it off with `O` or start with `--no-objects`. To try it without the drone, run `python obstacles.py` (webcam) or `python obstacles.py video.mp4 nano`.
-
 ### Trim (drift correction)
 
 | Key | Action |
@@ -110,8 +129,94 @@ Auto-trim watches the video to see which way the drone is sliding and adjusts th
 | --- | --- |
 | `P` | Save a photo |
 | `V` | Start / stop recording |
-| `H` | Show / hide the on-screen key map |
 | `O` | Object tracking on / off |
+| `H` | Show / hide the on-screen key map |
 | `ESC` | Quit (closing the window also quits) |
 
-Photos and recordings are saved to `media/`. In `probe` mode only the camera and display keys work; the flight and trim keys do nothing.
+Photos (`photo_*.jpg`) and recordings (`video_*.avi`) are saved to `media/`. In `probe` mode only these keys work; the flight and trim keys do nothing.
+
+## Object identification
+
+Only these are named on screen, each with an ID number such as `HUMAN #3`, `CHAIR #7` or `WALL #2`:
+
+| Name | Found by |
+| --- | --- |
+| human, chair, table, tv, bag (backpack / handbag / suitcase) | a small YOLOX model run by OpenCV (reliable) |
+| box | shape rule: a solid outline with 4–6 corners |
+| wall | shape rules, any of: a big blank area covering the middle of the view; a window (a bright, roughly rectangular area); a door (two tall upright lines a door's width apart with a crossbar on top, reaching toward the floor) |
+
+Windows and doors are shown as `WALL`, so in the flight path they set off the obstacle warning like any wall, an open door included. The model doesn't know boxes or walls, so those are guesses from shapes and brightness and are less reliable than the model's names. Anything else is still tracked, but only appears while it's in your way, as `OBSTACLE`.
+
+The model runs on its own thread, so a slow laptop makes names update less often but never freezes the video. The top bar shows the model and its time per frame (e.g. `TINY 50 ms`), `MODEL LOADING` while it starts, or `NO MODEL` if it couldn't be downloaded.
+
+**Built for a moving drone.**
+- Every frame it measures how the whole picture moved (the drone sliding, turning or flying forward) and moves every box with it, so boxes stay on their objects through fast moves. The model's late answers are carried forward the same way.
+- Frames smeared by a sudden jerk are skipped.
+- A name only appears after a few sightings and doesn't flip once it's settled.
+- A named object keeps its box and ID for up to 1.5 s if it's briefly missed (behind something, or blurred).
+
+Each kind of object has its own colour, and a key in the top-left lists the kinds on screen right now:
+
+| Colour | Object |
+| --- | --- |
+| magenta | human |
+| sky blue | chair |
+| green | table |
+| purple | tv |
+| orange | bag |
+| tan | box |
+| light grey | wall (including windows and doors) |
+
+Red and yellow are kept for warnings:
+
+| Look | Meaning |
+| --- | --- |
+| yellow seconds after the name (e.g. `CHAIR #4  3.2s`) | getting bigger, so you're closing in on it; that's the time to contact |
+| thick red brackets | in the flight path and either very close or under 2 s away: **OBSTACLE AHEAD** blinks. Unnamed things in the way show as red `OBSTACLE`. |
+| thin, dim brackets | briefly lost, still being predicted |
+
+Limits:
+- Small or far-away things and poor light make names less reliable.
+- In a blank or dark scene the camera motion can't be measured, so boxes follow less well.
+- Something that leaves the view and comes back gets a new ID.
+
+## The screen
+
+| Where | What |
+| --- | --- |
+| Top bar, left | `LIVE` / `CONNECTING` / `SIGNAL LOST`, hardware variant, drone Wi-Fi name and signal |
+| Top bar, right | Video delay in ms, resolution, fps, number of objects, object model and its speed, flight timer, recording timer |
+| Top-left | Speed buttons 1 / 2 / 3 |
+| Bottom-left | Key map (`H` hides it) |
+| Bottom-right | Stick positions (X/Y pad and Z bar) with the trim offset |
+| Right, above that | Drift: which way the drone is sliding and what auto-trim is doing (`CALIBRATING`, `CORRECTING`, `HOLDING`, `PAUSED`) |
+| Centre | Crosshair, object boxes and names, the `GO TO` ring, and banners (`TAKING OFF`, `LANDING`, `OBSTACLE AHEAD`, messages) |
+
+## Which drone do I have?
+
+There are two hardware variants. `drone.py` works out which one from the IP address your laptop gets on the drone's Wi-Fi:
+
+| Your IP | Variant | Video | Control |
+| --- | --- | --- | --- |
+| 192.168.1.x | **A** | RTSP `rtsp://192.168.1.1:7070/webcam` | UDP to 192.168.1.1:7099 |
+| 192.168.169.x | **B** | custom UDP on 192.168.169.1:8800 | same socket |
+
+If it says *Not on a drone network*, you aren't connected to the drone's Wi-Fi yet. Join it, or force a variant with `--variant`. The full protocol is in [PROTOCOL.md](PROTOCOL.md).
+
+## Files
+
+| File | What it is |
+| --- | --- |
+| `drone.py` | The main program: connection, keyboard flight, video window |
+| `hud.py` | Draws the heads-up display |
+| `protocol.py` | Packet builders and parsers, Variant-B video reassembler |
+| `jpeg_header.py` | Regenerates the JPEG headers Variant-B frames need |
+| `drift.py` | Drift detection and auto-trim from the video |
+| `target.py` | Click-to-go tracking and steering |
+| `obstacles.py` | Finds, names and tracks objects; camera-motion tracking; obstacle warnings. Runs on its own on a webcam or video. |
+| `detector.py` | The object-naming model (YOLOX via OpenCV DNN, downloaded once into `models/`) |
+| `test_sim.py` | Offline self-test against simulated drones |
+| `PROTOCOL.md` | Full protocol spec for both hardware variants |
+| `trim.json` | Saved trims (written automatically) |
+| `models/` | Downloaded object models (not in git) |
+| `media/` | Your photos and recordings (not in git) |

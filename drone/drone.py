@@ -19,7 +19,7 @@ sliding, and auto-trim offsets the sticks to cancel it (see drift.py). Every tim
 auto-calibrates for a few seconds with faster correction, then holds. Trims are saved
 to trim.json and reused next time.
 
-Objects: humans, chairs, tables, TVs, bags, boxes, windows, doors and walls are boxed, named and
+Objects: humans, chairs, tables, TVs, bags, boxes and walls (incl. windows / doors) are boxed, named and
 tracked with an ID (a small YOLOX model, downloaded once into models/, plus shape rules); anything
 else is only shown while it's in the way, as "obstacle". Anything in the flight path that is close or closing in fast turns red with an
 OBSTACLE AHEAD warning (see obstacles.py). It only warns - it never steers the drone.

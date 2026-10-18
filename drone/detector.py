@@ -1,7 +1,7 @@
 """Named object detection (human, chair, table, tv, bag) with a small YOLOX model run by OpenCV's DNN.
 
 The model is trained on COCO's 80 everyday classes; only the ones in KEEP are reported, under the
-names given there. (COCO has no box, window, door or wall - obstacles.py finds those by shape.)
+names given there. (COCO has no box or wall - obstacles.py finds those by shape.)
 It's an ONNX file that's downloaded once into models/ on first use:
 
   tiny   20 MB  ~30 ms per frame on a laptop CPU   (default, better at small / far things)

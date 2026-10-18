@@ -1,7 +1,7 @@
 """Find, name and track objects / obstacles in the drone's video.
 
-Names shown: human, chair, table, tv, bag, box, window, door, wall. Anything else is tracked but
-only shown while it's in the way, as "obstacle".
+Names shown: human, chair, table, tv, bag, box, wall. Anything else is tracked but only shown
+while it's in the way, as "obstacle". Windows and doors count as wall.
 
 Two detectors feed one tracker:
   named      a small YOLOX model (detector.py) on a background thread: human, chair, table, tv,
@@ -9,11 +9,9 @@ Two detectors feed one tracker:
   generic    the model-free detector below. It finds anything that stands out, and names a few
              things by shape rules - rougher guesses than the model's:
                box     a solid outline with 4-6 corners
-               window  a bright, roughly rectangular region (daylight; a lit lamp or a white
-                       sheet fools it, a window at night isn't found)
-               door    two long upright lines a door's width apart reaching towards the floor,
-                       joined by a level line across the top (wardrobes can look the same)
-               wall    a big blank area around the centre of the picture
+               wall    any of: a big blank area around the centre of the picture; a window
+                       (a bright, roughly rectangular region); a door (two long upright lines a
+                       door's width apart reaching towards the floor, joined across the top)
              Generic boxes that land on a named one are dropped, so a human isn't also chopped
              into pieces.
 
@@ -43,8 +41,6 @@ Obstacle warning (forward camera):
   A box that keeps growing is something we're closing in on. Its growth rate gives a
   time-to-contact (TTC = size / growth per second). A track is a "threat" when it sits in the
   flight corridor (the middle of the picture) and is either big (NEAR) or TTC < TTC_WARN.
-
-A door is never a threat - it's the way through.
 
 Limits: low light and heavy JPEG blocking cause flicker; the shape rules are guesses.
 """
@@ -79,7 +75,7 @@ DOOR_LINTEL = 0.6         # ... with a level line across this much of the top
 WALL_AREA = 0.35          # blank area around the centre this big = wall ahead
 WALL_LIGHT = (25, 235)    # mean brightness range in which a blank area can be judged
 LONG_LINE = 0.4           # edges longer than this (fraction of the width) are room structure
-SCENE = {"wall", "door", "window"}
+SCENE = {"wall"}           # room structure (windows and doors are reported as wall)
 HEURISTIC_VOTE = 0.2      # a shape-rule name counts this much (model names count their score)
 
 MATCH_IOU = 0.15          # min overlap to match a box to a track
@@ -240,7 +236,7 @@ def without_long_lines(edges):
 
 def detect(frame):
     """Candidate boxes (N, 4 array of x0 y0 x1 y1 fractions of the picture) and their labels:
-    "box" / "window" / "door" / "wall", or None for an unnamed thing that stands out."""
+    "box" / "wall", or None for an unnamed thing that stands out."""
     return _detect(shrink(frame))
 
 
@@ -272,9 +268,9 @@ def _detect(small):
         if all(inside[i, k] < INSIDE for k in keep):
             keep.append(i)
     things = [things[i] for i in keep]
-    # scene parts: may contain things (a chair in front of a wall), so they don't swallow them,
-    # but a thing that *is* the window / door outline is dropped
-    scene = windows(gray) + doors(raw_edges, gray) + wall(raw_edges, gray)
+    # room structure - windows and doors count as wall. It may contain things (a chair in front of
+    # a wall), so it doesn't swallow them, but a thing that *is* a window / door outline is dropped
+    scene = [(b, "wall") for b, _ in windows(gray) + doors(raw_edges, gray) + wall(raw_edges, gray)]
     if scene and things:
         sb = np.array([b for b, _ in scene], np.float32)
         same = iou(np.array([b for b, _ in things], np.float32), sb) >= 0.5
@@ -284,8 +280,7 @@ def _detect(small):
 
 
 def compatible(track_label, det_label):
-    """Walls, doors and windows only ever match their own kind, so a chair track can't slide onto
-    the wall behind it; everything else may (the model sometimes flips chair <-> table)."""
+    """Walls only ever match walls, so a chair track can't slide onto the wall behind it; everything else may (the model sometimes flips chair <-> table)."""
     if track_label in SCENE or det_label in SCENE:
         return track_label == det_label
     return True
@@ -475,7 +470,7 @@ class ObstacleTracker:
         if not self.blurry:
             shapes, kinds = _detect(small)
             if t - self.named_t <= NAMED_FRESH and len(self.named) and len(shapes):
-                # shapes on top of a named thing are pieces of it (walls / doors / windows may hold one)
+                # shapes on top of a named thing are pieces of it (a wall may hold one)
                 inside = intersection(shapes, self.named) / np.maximum(area(shapes), 1e-9)[:, None]
                 scene = np.array([k in SCENE for k in kinds], bool)
                 ok = ((inside < INSIDE).all(1) & (iou(shapes, self.named) < MATCH_IOU).all(1)) | scene
@@ -546,7 +541,7 @@ class ObstacleTracker:
         self.tracks = [tr for k, tr in enumerate(self.tracks) if k not in gone]
 
     def is_threat(self, tr):
-        if self.camera != "forward" or tr.label == "door":     # a door is the way through
+        if self.camera != "forward":
             return False
         x0, _, x1, _ = tr.box
         in_path = x1 > 0.5 - CORRIDOR / 2 and x0 < 0.5 + CORRIDOR / 2
@@ -575,6 +570,7 @@ if __name__ == "__main__":
     # Try it on a webcam or a video file: python obstacles.py [index-or-path] [tiny|nano|off]
     import sys
     import time
+    import hud
     src = sys.argv[1] if len(sys.argv) > 1 else "0"
     model = sys.argv[2] if len(sys.argv) > 2 else "tiny"
     cap = cv2.VideoCapture(int(src) if src.isdigit() else src)
@@ -584,14 +580,10 @@ if __name__ == "__main__":
         if not ok:
             break
         tracker.update(frame, time.time())
-        h, w = frame.shape[:2]
-        for o in tracker.objects():
-            x0, y0, x1, y1 = o["box"]
-            color = (70, 70, 240) if o["threat"] else (90, 220, 90)
-            cv2.rectangle(frame, (int(x0 * w), int(y0 * h)), (int(x1 * w), int(y1 * h)), color, 2)
-            label = f"{o['label']} #{o['id']}" + (f" {o['ttc']:.1f}s" if o["ttc"] else "")
-            cv2.putText(frame, label, (int(x0 * w), int(y0 * h) - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        cv2.putText(frame, f"{tracker.ms:.1f} ms  {tracker.model_status[0]}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1)
-        cv2.imshow("obstacles", frame)
+        canvas = hud.fit(frame)                      # drawn exactly like the drone window
+        hud.object_boxes(canvas, {"t": time.time(), "fly": False, "frame_shape": frame.shape,
+                                  "objects": tracker.objects()})
+        hud.text(canvas, f"{tracker.ms:.1f} ms  {tracker.model_status[0]}", (12, 24), hud.WHITE, 0.5)
+        cv2.imshow("obstacles", canvas)
         if cv2.waitKey(1) == 27:
             break
