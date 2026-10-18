@@ -3,13 +3,16 @@
 
   python drone.py                  # join the drone's Wi-Fi first, then run this
   python drone.py probe            # video only, sends NO flight commands
+  python drone.py --webcam         # test window on the laptop's webcam: no drone, no commands
   python drone.py --save frames/   # also save every video frame as JPEG
 
 Keys (in the video window) – hold a movement key to push harder, let go to stop:
   W/S forward/back   A/D left/right   UP/DOWN (or R/F) up/down
   T take off   L land   SPACE motors off   C gyro calibrate (on the ground)
   SHIFT + W/A/S/D/R/F nudge trim   K auto-trim on/off   BACKSPACE reset trim
-  P photo   V start/stop recording   O object boxes on/off   H hide key map   ESC quit
+  H headless mode on/off   P photo   V start/stop recording   O object boxes on/off
+  ? show/hide the key list   ESC quit
+  Z depth view on/off   M depth calibration: camera square to a wall --cal-distance m away (1 m)
   CLICK the video to fly there, same height (see target.py)   RIGHT-CLICK or a movement key cancels
   SPEED 1/2/3: click the buttons in the window (no key)
 Photos and recordings go to the media/ folder next to this script.
@@ -38,7 +41,7 @@ import time
 from collections import deque
 
 from protocol import (A_CONTROL_OFF, A_HEARTBEAT, A_IP, A_CTRL_PORT, A_RTSP, B_CMD_CONTROL_OFF,
-                      B_CMD_START, B_HELLO, B_IP, B_PORT, BReceiver, CENTER, FLAG_GYRO_CAL, FLAG_LAND,
+                      B_CMD_START, B_HELLO, B_IP, B_PORT, BReceiver, CENTER, FLAG_GYRO_CAL, FLAG_HEADLESS, FLAG_LAND,
                       FLAG_STOP, FLAG_TAKEOFF, SPEED_RANGES, Sticks, T_ACK, T_CTLMSG, T_FRAG,
                       a_control_packet, a_parse_status, b_ctlmsg_reply, b_parse, control_frame)
 
@@ -48,6 +51,7 @@ try:
     import drift
     import hud
     import obstacles
+    import depth
     import target
 except ImportError:
     cv2 = None
@@ -70,7 +74,7 @@ TRIM_KEYS = {ord("W"): ("y", 1), ord("S"): ("y", -1), ord("D"): ("x", 1), ord("A
              ord("R"): ("z", 1), ord("F"): ("z", -1)}      # SHIFT gives the capital letter
 
 # key name -> (OpenCV waitKey code, Windows virtual-key code)
-KEY_CODES = {c: (ord(c), ord(c.upper())) for c in "wasdrftlpvhcko"}
+KEY_CODES = {c: (ord(c), ord(c.upper())) for c in "wasdrftlpvhckozm"}
 KEY_CODES.update(space=(32, 0x20), esc=(27, 0x1B), up=(None, 0x26), down=(None, 0x28),
                  shift=(None, 0x10), back=(8, 0x08))
 
@@ -146,6 +150,7 @@ class Pilot:
         self.trim = dict.fromkeys(AXES, 0.0)    # % offset added to every stick, cancels drift
         self.speed = 1                          # app speed mode 1-3: right-stick range (SPEED_RANGES)
         self.steering = False                   # click-to-go is driving: ignore the speed mode
+        self.headless = False                   # drone's headless mode: sticks relative to the pilot
         self._pulses = {}                       # flag -> expires
 
     def set_speed(self, speed):
@@ -210,15 +215,17 @@ class Pilot:
                 reach = 127 if axis == "z" or self.steering else SPEED_RANGES[self.speed]
                 v = self.level[axis] * reach / 127 + self.trim[axis]
                 setattr(s, name, CENTER + round(max(-100.0, min(100.0, v)) / 100 * 127))
-        s.flags = self.action()[0]
+        # headless rides in every packet while it's on, like the app's toggle (protocol.FLAG_HEADLESS)
+        s.flags = self.action()[0] | (FLAG_HEADLESS if self.headless else 0)
         return s
 
 
 class Link:
     def __init__(self, variant, fly, save_dir, verbose, camera="forward", autotrim=True, objects=True,
-                 model="tiny"):
+                 model="tiny", depth="fast", cal_distance=1.0):
         self.variant, self.fly, self.save_dir, self.verbose = variant, fly, save_dir, verbose
         self.camera, self.autotrim, self.objects, self.model = camera, autotrim, objects, model
+        self.depth, self.cal_distance = depth, cal_distance
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 0))
         self.sock.settimeout(0.005)
@@ -294,6 +301,23 @@ class Link:
                     self.send(b"\x09\x02", dest)
         if self.fly:
             self.send(A_CONTROL_OFF, dest)
+
+    def video_webcam(self, index):
+        """Test mode: the laptop's webcam stands in for the drone's camera."""
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
+        if not cap.isOpened():
+            self.log(f"couldn't open webcam {index}")
+            return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        while self.running:
+            ok, frame = cap.read()
+            if not ok:
+                time.sleep(0.1)
+                continue
+            self.frames += 1
+            self.latest_jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+        cap.release()
 
     def video_a(self):
         if cv2 is None:
@@ -382,7 +406,8 @@ class Link:
         toasts = []                     # (message, expires)
         writer = rec_start = rec_size = None
         flight_start = None
-        show_keys = True
+        show_keys = False                # the key list (?), hidden by default
+        show_depth = False
         last_t = time.time()
         est = drift.DriftEstimator(self.camera)
         auto = drift.AutoTrim(self.pilot, self.autotrim)
@@ -390,7 +415,7 @@ class Link:
         saved_trim = self.pilot.trims()
         last_input = last_drift_log = 0.0
         goto = target.ClickTarget(self.camera)
-        obs = obstacles.ObstacleTracker(self.camera, self.model, self.log)
+        obs = obstacles.ObstacleTracker(self.camera, self.model, self.log, self.depth)
         obs.enabled = self.objects
         clicks = []                     # (button, canvas x, canvas y) from the mouse callback
 
@@ -477,9 +502,7 @@ class Link:
                            "timeout": "couldn't reach target – stopped"}[goto.state])
                 was = auto.state
                 auto.update(est, now - last_t, airborne, now - last_input)
-                if auto.state == "calibrating" and was != "calibrating":
-                    toast("stopped – calibrating drift")
-                elif was == "calibrating" and auto.state in ("learning", "steady"):
+                if was == "calibrating" and auto.state in ("learning", "steady"):
                     t = self.pilot.trims()
                     toast(f"calibrated  trim X {t['x']:+.0f}  Y {t['y']:+.0f}  Z {t['z']:+.0f}")
                 if auto.state in ("calibrating", "learning") and now - last_drift_log > 3.0:
@@ -505,6 +528,7 @@ class Link:
             toasts[:] = [t for t in toasts if t[1] > now]
             state = {
                 "t": now, "fly": self.fly, "variant": self.variant.upper(), "waiting": img is None,
+                "webcam": self.variant == "webcam",
                 "status": status, "wifi": self.wifi, "res": res,
                 "fps": sum(1 for t in frame_times if now - t < 2.0) / 2.0,
                 "age_ms": None if age is None else int(age * 1000),
@@ -512,12 +536,17 @@ class Link:
                 "rec": None if writer is None else now - rec_start,
                 "levels": self.pilot.levels(), "action": self.pilot.action(),
                 "pressed": pressed, "focused": focused, "show_keys": show_keys,
+                "headless": self.pilot.headless,
                 "trim": trims, "drift": dict(est.vel), "drift_valid": est.valid,
                 "drift_text": drift.describe(est.vel), "auto": auto.state,
                 "goto": goto.norm() if goto.active and img is not None else None,
                 "frame_shape": None if img is None else img.shape, "speed": self.pilot.speed,
                 "objects": obs.objects() if obs.enabled and img is not None else None,
                 "model": obs.model_status,
+                "depth_status": obs.depth_status if obs.enabled else None,
+                "ahead": obs.ahead_info() if obs.enabled and img is not None else (None, False),
+                "depth_img": obs.depth_map.colour((img.shape[1], img.shape[0]))
+                if show_depth and obs.depth_map is not None and img is not None else None,
                 "toasts": [m for m, _ in reversed(toasts)],
             }
             canvas = hud.fit(img)
@@ -573,8 +602,22 @@ class Link:
                     toast(f"recording: media/{os.path.basename(path)}")
                 else:
                     toast("no video yet")
-            elif k == ord("h"):
+            elif self.fly and k == ord("h"):
+                # headless: the drone takes "forward" as the way its nose pointed when this was
+                # switched on, whichever way it turns afterwards - point it away from you first
+                self.pilot.headless = not self.pilot.headless
+                toast("headless on - forward = away from you" if self.pilot.headless else "headless off")
+            elif k == ord("?") or k == ord("/"):
                 show_keys = not show_keys
+            elif k == ord("z"):
+                show_depth = not show_depth
+                toast("depth view " + ("on" if show_depth else "off"))
+            elif k == ord("m"):
+                if img is None or obs.depth is None or obs.depth.status != "ready":
+                    toast("depth not ready")
+                else:
+                    scale = obs.calibrate_depth(img, self.cal_distance)
+                    toast(f"depth calibrated at {self.cal_distance:.2f} m: scale x{scale:.2f}")
             elif k == ord("o"):
                 obs.enabled = not obs.enabled
                 toast("object tracking " + ("on" if obs.enabled else "off"))
@@ -597,11 +640,30 @@ def main():
                     help="which way the drone's camera points (for drift detection)")
     ap.add_argument("--no-autotrim", action="store_true", help="start with auto-trim off (K toggles)")
     ap.add_argument("--no-objects", action="store_true", help="start with object tracking off (O toggles)")
+    ap.add_argument("--depth", choices=["fast", "fine", "off"], default="fast",
+                    help="distance model: fast (default, ~50 ms on a GPU), fine (sharper, slow), off")
+    ap.add_argument("--cal-distance", type=float, default=1.0, metavar="M",
+                    help="for depth calibration (key M): metres from the camera to the wall (default 1)")
     ap.add_argument("--model", choices=["tiny", "nano", "off"], default="tiny",
                     help="object-naming model: tiny (default), nano (faster CPUs), off (unnamed boxes)")
+    ap.add_argument("--webcam", nargs="?", const=0, type=int, metavar="N",
+                    help="test window on webcam N (default 0) instead of the drone: no flight commands")
+    ap.add_argument("--hfov", type=float, metavar="DEG",
+                    help="camera field of view for depth, until calibrate_camera.py has measured it "
+                         "(default: 90 for the drone, 65 for a webcam)")
     args = ap.parse_args()
 
-    variant = args.variant or detect_variant()
+    if args.webcam is not None and cv2 is None:
+        sys.exit("The webcam test needs OpenCV: pip install opencv-python numpy")
+    if args.webcam is not None:
+        # the webcam isn't the drone's camera: its own lens guess and calibration files
+        depth.CAMERA_FILE = os.path.join(HERE, "camera_webcam.json")
+        depth.CAL_FILE = os.path.join(HERE, "depth_cal_webcam.json")
+        depth.CAMERA_HFOV = args.hfov or 65.0
+        args.mode = "probe"
+    elif args.hfov and cv2 is not None:
+        depth.CAMERA_HFOV = args.hfov
+    variant = "webcam" if args.webcam is not None else args.variant or detect_variant()
     if not variant:
         sys.exit("Not on a drone network (expected 192.168.1.x or 192.168.169.x). "
                  "Join the drone's Wi-Fi or pass --variant.")
@@ -612,14 +674,19 @@ def main():
         sys.exit("Flying needs OpenCV for the video window: pip install opencv-python numpy")
 
     link = Link(variant, fly, args.save, args.verbose, args.camera, not args.no_autotrim, not args.no_objects,
-                None if args.model == "off" else args.model)
-    link.log(f"variant {variant.upper()} – {'A: 192.168.1.1' if variant == 'a' else 'B: 192.168.169.1:8800'}")
+                None if args.model == "off" else args.model, None if args.depth == "off" else args.depth,
+                args.cal_distance)
+    if variant == "webcam":
+        link.log(f"webcam {args.webcam} test - no drone, no flight commands. ? shows the keys, ESC quits")
+        threads = [threading.Thread(target=link.video_webcam, args=(args.webcam,), daemon=True)]
+    else:
+        link.log(f"variant {variant.upper()} – {'A: 192.168.1.1' if variant == 'a' else 'B: 192.168.169.1:8800'}")
+        threads = [threading.Thread(target=link.run_a if variant == "a" else link.run_b, daemon=True)]
     if fly:
         link.log("click the video window, then:", HELP)
-    threads = [threading.Thread(target=link.run_a if variant == "a" else link.run_b, daemon=True)]
     if variant == "a":
         threads.append(threading.Thread(target=link.video_a, daemon=True))
-    if sys.platform == "win32":
+    if sys.platform == "win32" and variant != "webcam":
         threads.append(threading.Thread(target=link.wifi_monitor, daemon=True))
     for t in threads:
         t.start()

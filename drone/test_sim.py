@@ -121,4 +121,33 @@ except socket.timeout: pass
 assert seen[0] == b"\x01\x01" and any(p[:2] == b"\x03\x66" and len(p) == 9 for p in seen)
 assert b"\x09\x01" in seen and seen[-1] == b"\x08\x01"
 print(f"variant A: heartbeat, {sum(p[:1]==bytes([3]) for p in seen)} control packets, photo-button ack, control-off on exit")
+# ---- depth: sampling, filtering, geometry and calibration maths (no model needed) ----------
+import math, os, tempfile
+import numpy as np
+import depth, obstacles
+cam = depth.Camera(hfov=60.0)
+assert abs(cam.fx - depth.TRAIN_FOCAL) < 0.01, cam.fx            # a 60 deg lens = the training camera
+assert abs(depth.Camera(hfov=90.0).fx - 0.5) < 1e-9
+x, y, z = cam.point(0.5 + 0.5, 0.5, 2.0)                          # right edge of a 60 deg view, 2 m away
+assert abs(math.degrees(math.atan2(x, z)) - 30.0) < 0.5 and y == 0.0
+scene = np.full((252, 420), 3.0, np.float32)                     # a wall 3 m away ...
+scene[100:200, 150:270] = 1.2                                     # ... with a chair 1.2 m away in front
+dm = depth.DepthMap(scene, 0.0, cam)
+assert abs(dm.box((0.33, 0.37, 0.67, 0.82)) - 1.2) < 0.01         # its box: the chair, not the wall
+assert abs(dm.ahead() - 1.2) < 0.01 and abs(dm.at(0.05, 0.05) - 3.0) < 0.01
+tr = obstacles.Track(1, (0.3, 0.3, 0.6, 0.8), 0.0, "chair", 0.9, True)
+for z in (2.0, 2.04, 1.98, 3.5):                                  # one wild reading (3.5) is doubted ...
+    tr.measure(z, 0.0)
+assert 1.95 < tr.dist < 2.1 and tr.dist_doubt == 1, (tr.dist, tr.dist_doubt)
+for z in (3.4, 3.45):                                             # ... but three in a row are believed
+    tr.measure(z, 0.0)
+assert abs(tr.dist - 3.45) < 1e-6
+depth.CAL_FILE = os.path.join(tempfile.mkdtemp(), "depth_cal.json")   # never touch the real one
+m = depth.DepthModel.__new__(depth.DepthModel)
+m.camera, m.cal = depth.Camera(hfov=90.0), {"scale": 1.0, "samples": []}
+m.raw = lambda frame: np.full((252, 420), 2.0, np.float32)        # model says 2 m (before lens)
+scale = m.calibrate(None, 1.0)                                    # the wall is really 1 m away
+assert abs(m.predict(None).mean() - 1.0) < 1e-4, scale
+print(f"depth: near-surface sampling, jump doubting, 3D position, lens x{m.lens_factor:.2f} "
+      f"and tape calibration (x{scale:.2f}) all check out")
 print("ALL TESTS PASSED")

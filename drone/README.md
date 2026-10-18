@@ -5,10 +5,11 @@ A standalone Python tool inside VisionAiry. It flies a cheap Wi-Fi toy drone fro
 ## What it does
 
 - **Live video** from the drone in a window with a heads-up display: connection status, Wi-Fi signal, latency, fps, flight timer, stick positions and drift.
-- **Keyboard flight**: take off, land, emergency stop, move, climb and descend, with three speed modes like the phone app.
+- **Keyboard flight**: take off, land, emergency stop, move, climb and descend, with three speed modes and headless mode like the phone app.
 - **Auto-trim**: watches the video to see which way the drone drifts on its own and trims it out. Trims are remembered between flights.
 - **Click to go**: click a spot in the video and the drone flies there at the same height.
 - **Object identification**: boxes, names and tracks **humans, chairs, tables, TVs, bags, boxes and walls** (windows and doors count as walls), each with an ID (`CHAIR #7`). It's built to stay steady while the drone moves.
+- **Distance (depth)**: how far away every object is in metres (`CHAIR #7  1.8 m`), plus its 3D position and direction, and how far it is to whatever is straight ahead. This is the base for flying to objects by voice later.
 - **Obstacle warning**: anything in the flight path that is very close, or that you'll reach in under 2 s, turns red and **OBSTACLE AHEAD** blinks. It only warns; it never steers the drone.
 - **Photos and recording** to `media/`.
 
@@ -26,19 +27,20 @@ What it doesn't do:
 | Python 3 | tested with 3.14 |
 | `opencv-python` | video window, image processing, and runs the object model. Tested with OpenCV 5.0. |
 | `numpy` | |
+| `onnxruntime-directml` | runs the depth model, on the GPU when there is one (AMD, Intel or NVIDIA on Windows). Use plain `onnxruntime` on macOS or Linux. |
 | `pillow` | only for `test_sim.py` |
 | Windows (recommended) | Instant key press and release, and the Wi-Fi signal readout, use Windows APIs. On macOS or Linux it still works, but held keys rely on keyboard auto-repeat and there's no signal readout. |
 | A laptop with Wi-Fi | it joins the drone's own Wi-Fi network |
 
 ```
-pip install opencv-python numpy pillow
+pip install opencv-python numpy pillow onnxruntime-directml
 ```
 
 **Object model (about 20 MB):** it's downloaded automatically into `models/` the first time you run it. **The drone's Wi-Fi has no internet**, so do the first run while you're still on your normal internet, for example `python obstacles.py`. Without the model everything still works, but only box and wall get names.
 
 ## Quick start
 
-1. `cd drone` and `pip install opencv-python numpy pillow`.
+1. `cd drone` and `pip install opencv-python numpy pillow onnxruntime-directml`.
 2. While still on normal internet, run `python obstacles.py` once so the object model downloads. Close it with `ESC`.
 3. Turn the drone on and join its Wi-Fi from your laptop. The name usually starts with `HD-720P-`, `HD-FPV-`, `HD720-` or `FHD-`.
 4. Run `python drone.py`.
@@ -51,6 +53,7 @@ pip install opencv-python numpy pillow
 | --- | --- |
 | `python drone.py` | Video window and full flight control (same as `python drone.py fly`) |
 | `python drone.py probe` | Video, HUD and object tracking, but sends **no flight commands**. Safe for testing the connection with the drone on the table. |
+| `python drone.py --webcam` | **Test window on the laptop's webcam**, no drone needed: the same screen with object boxes, distances, depth view (`Z`) and depth calibration (`M`). Sends nothing anywhere. `--webcam 1` picks another camera. |
 | `python obstacles.py` | Object identification on your **webcam**, no drone needed |
 | `python obstacles.py 1` | Same, on webcam number 1 |
 | `python obstacles.py video.mp4` | Same, on a video file |
@@ -72,6 +75,12 @@ They can be combined, e.g. `python drone.py --camera down --model nano`.
 | `--model tiny` | Object model: about 20 MB, about 50 ms per frame, better on small or far things (default) |
 | `--model nano` | Smaller, faster model (about 4 MB, about 25 ms per frame) for slower laptops |
 | `--model off` | No model. Only box and wall are named. |
+| `--depth fast` | Distance model at 420x252: about 50 ms per frame on a GPU (default) |
+| `--depth fine` | Sharper distance model at 630x378: about 430 ms per frame, so updates are slower |
+| `--depth off` | No distances |
+| `--webcam N` | Use webcam N (default 0) instead of the drone; no flight commands. Its lens and depth calibration are kept separately (`camera_webcam.json`, `depth_cal_webcam.json`; for the lens use `calibrate_camera.py --webcam`). |
+| `--hfov DEG` | Camera field of view used for distances until the lens is calibrated (default 90 for the drone, 65 for a webcam) |
+| `--cal-distance M` | For depth calibration (key `M`): how many metres the wall is from the camera (default 1) |
 | `-v`, `--verbose` | Print every packet sent to the drone |
 | `-h`, `--help` | List all options |
 
@@ -92,6 +101,7 @@ Hold a movement key to push harder; let go and that stick recenters.
 | `L` | Land |
 | `SPACE` | Motors off (emergency stop) |
 | `C` | Gyro calibrate (only on the ground) |
+| `H` | Headless mode on / off: **forward** means away from you, whichever way the drone's nose points. Point the drone away from you before switching it on. |
 
 ### Speed
 
@@ -121,7 +131,7 @@ The spot is tracked in the video while the drone moves. It stops when it gets th
 | `K` | Turn auto-trim on or off |
 | `BACKSPACE` | Reset trim to zero |
 
-Auto-trim watches the video to see which way the drone is sliding and adjusts the trim to cancel the drift. Each time you stop moving (0.7 s after you release the keys), and again right after take off, it calibrates for 3 seconds with faster correction (the HUD shows **CALIBRATING**), then goes back to a slow hold. Pressing a movement key interrupts the calibration. Trims are saved to `trim.json` and reused next time.
+Auto-trim watches the video to see which way the drone is sliding and adjusts the trim to cancel the drift. Each time you stop moving (0.7 s after you release the keys), and again right after take off, it calibrates for 3 seconds with faster correction (the top bar shows **CALIBRATING DRIFT**), then goes back to a slow hold. Pressing a movement key interrupts the calibration. Trims are saved to `trim.json` and reused next time.
 
 ### Camera and display
 
@@ -130,7 +140,9 @@ Auto-trim watches the video to see which way the drone is sliding and adjusts th
 | `P` | Save a photo |
 | `V` | Start / stop recording |
 | `O` | Object tracking on / off |
-| `H` | Show / hide the on-screen key map |
+| `Z` | Depth view on / off: colours the video by distance (red near, blue far) |
+| `M` | Depth calibration: see [Distance (depth)](#distance-depth) |
+| `?` | Show / hide the list of keys |
 | `ESC` | Quit (closing the window also quits) |
 
 Photos (`photo_*.jpg`) and recordings (`video_*.avi`) are saved to `media/`. In `probe` mode only these keys work; the flight and trim keys do nothing.
@@ -180,17 +192,53 @@ Limits:
 - In a blank or dark scene the camera motion can't be measured, so boxes follow less well.
 - Something that leaves the view and comes back gets a new ID.
 
+## Distance (depth)
+
+Each object's name tag shows its distance, e.g. `CHAIR #7  1.8 m`. A `~` (as in `~1.8 m`) means the distance is being predicted from the drone's motion rather than measured just now. Under the crosshair is the distance to the nearest thing straight ahead. **OBSTACLE AHEAD** blinks when that's under 0.8 m, or when an object in the flight path is closer than that.
+
+A single camera can't measure distance directly like two eyes; a model judges it from how things look. It uses [Depth Anything V2 Metric Indoor](https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf), which is trained on indoor scenes and gives metres. Four things make those metres trustworthy:
+
+1. **Lens correction.** The model assumes the camera it was trained with, but toy-drone lenses are wider, which makes everything look farther away. Distances are corrected for the drone's actual lens. That lens is guessed (90° wide) until you measure it with a checkerboard (below).
+2. **Tape-measure calibration.** Measures what's left of this camera's error.
+3. **Steadiness.** Each new depth map is shifted to follow the drone's movement and blended with the last, so it doesn't flicker. In tests, distances changed less than 1% from frame to frame.
+4. **Near surface.** An object's distance comes from the closest part of the middle of its box, so it's the front of the chair, not the wall behind it.
+
+**Calibrate once per drone, for the best accuracy:**
+
+1. **Lens.** Print a checkerboard (search "opencv chessboard 9x6") and tape it to something flat. Run `python drone.py probe --save calib/` and show the board to the camera from 15–30 different angles and distances. Then run `python calibrate_camera.py calib/`, which writes `camera.json`. On synthetic tests it measured the lens to within 0.2%.
+2. **Scale.** Point the camera straight at a flat wall exactly 1 m away (tape measure) and press **M**. For other distances, start with `--cal-distance 2`. Pressing M at a few different distances averages them. The result is saved in `depth_cal.json`.
+
+**Safety margin:** warnings (and later, flying to objects) assume everything is **20% closer** than the estimate. Getting it wrong in that direction means stopping early; the other way means crashing. The numbers on screen are the plain estimate; code should plan with `dist_safe`. To change the margin, edit `SAFETY` in `obstacles.py`.
+
+Accuracy to expect:
+- **Uncalibrated:** roughly ±20–40%.
+- **After both steps:** typically ±5–10% indoors, at 0.3–5 m.
+
+It's worst on plain featureless walls and glass, very close up (under about 0.3 m) and in poor light. Objects cut off by the frame edge keep their last measured distance, carried forward by the drone's motion.
+
+**For code (voice commands):** `ObstacleTracker.objects()` gives, for each object:
+
+| Field | Meaning |
+| --- | --- |
+| `dist` | metres to its near surface |
+| `dist_fresh` | `True` if just measured, `False` if predicted |
+| `dist_safe` | `dist` with the safety margin taken off: plan with this one |
+| `xyz` | metres: right, down, forward |
+| `bearing` | degrees right of straight ahead |
+
+`ahead_info()` gives the distance to whatever is straight ahead. [depth.py](depth.py) has the details.
+
+The depth model is about 99 MB, in `models/`. It's built from the official weights with `python export_depth.py`, which needs PyTorch. If it's missing, drone.py downloads a ready-made version instead, which is slower and squashes the picture slightly.
+
 ## The screen
 
 | Where | What |
 | --- | --- |
-| Top bar, left | `LIVE` / `CONNECTING` / `SIGNAL LOST`, hardware variant, drone Wi-Fi name and signal |
-| Top bar, right | Video delay in ms, resolution, fps, number of objects, object model and its speed, flight timer, recording timer |
-| Top-left | Speed buttons 1 / 2 / 3 |
-| Bottom-left | Key map (`H` hides it) |
-| Bottom-right | Stick positions (X/Y pad and Z bar) with the trim offset |
-| Right, above that | Drift: which way the drone is sliding and what auto-trim is doing (`CALIBRATING`, `CORRECTING`, `HOLDING`, `PAUSED`) |
-| Centre | Crosshair, object boxes and names, the `GO TO` ring, and banners (`TAKING OFF`, `LANDING`, `OBSTACLE AHEAD`, messages) |
+| Top bar, left | `LIVE` / `CONNECTING` / `SIGNAL LOST` and the drone's Wi-Fi signal |
+| Top bar, middle | Modes, only while they apply: `HEADLESS`, `CALIBRATING DRIFT`, `AUTO-TRIM OFF`, `PROBE` |
+| Top bar, right | Video delay, fps, flight time, recording time. Object and depth model status only appear if something is wrong (`MODEL LOADING`, `NO DEPTH`, ...) |
+| Centre | Crosshair with the distance to whatever is straight ahead, object boxes with names and distances, the `GO TO` ring, and banners (`TAKING OFF`, `LANDING`, `OBSTACLE AHEAD`, messages) |
+| Bottom-left | Speed buttons 1 / 2 / 3 (click), and `? keys` |
 
 ## Which drone do I have?
 
@@ -215,6 +263,9 @@ If it says *Not on a drone network*, you aren't connected to the drone's Wi-Fi y
 | `target.py` | Click-to-go tracking and steering |
 | `obstacles.py` | Finds, names and tracks objects; camera-motion tracking; obstacle warnings. Runs on its own on a webcam or video. |
 | `detector.py` | The object-naming model (YOLOX via OpenCV DNN, downloaded once into `models/`) |
+| `depth.py` | Distance model (Depth Anything V2 Metric Indoor via onnxruntime), lens and tape calibration, depth smoothing |
+| `export_depth.py` | Builds the depth model files in `models/` from the official weights (needs PyTorch) |
+| `calibrate_camera.py` | Measures the camera's lens from checkerboard photos and writes `camera.json` |
 | `test_sim.py` | Offline self-test against simulated drones |
 | `PROTOCOL.md` | Full protocol spec for both hardware variants |
 | `trim.json` | Saved trims (written automatically) |

@@ -37,6 +37,13 @@ Track (built for a camera that moves a lot):
   Lifetime       shown after CONFIRM sightings; kept COAST s unseen (COAST_NAMED once named).
                  No new track starts on top of an existing one. Two tracks on the same thing are merged, the older ID wins.
 
+Distance (depth.py, when a depth model is available):
+  Each track gets a distance in metres: the near surface inside its box on each new depth map,
+  smoothed, with one-off jumps ignored (three in a row are believed). Between depth maps it is
+  carried forward by how fast the box grows (twice as big = half as far). Every object also gets
+  a position (x right, y down, z forward, metres) and a bearing (degrees right of straight ahead):
+  what flying to it by voice needs. "ahead" is the nearest thing in the flight path.
+
 Obstacle warning (forward camera):
   A box that keeps growing is something we're closing in on. Its growth rate gives a
   time-to-contact (TTC = size / growth per second). A track is a "threat" when it sits in the
@@ -50,6 +57,7 @@ from collections import deque
 import cv2
 import numpy as np
 
+import depth as depthmod
 import detector
 
 WORK_WIDTH = 320          # frames are shrunk to this width before detection
@@ -102,6 +110,16 @@ CORRIDOR = 0.4            # middle fraction of the picture width the drone flies
 NEAR = 0.45               # box this tall (fraction of the picture) = very close
 TTC_WARN = 2.0            # s, time-to-contact that counts as a threat
 TTC_SHOW = 6.0            # s, time-to-contact worth showing at all
+NEAR_M = 0.8              # m: anything in the flight path nearer than this is a threat
+SAFETY = 0.8              # decisions (warnings, later flying to things) treat every distance as this
+                          # much of the estimate - i.e. assume things are 20% nearer than they look:
+                          # a too-short guess stops early, a too-long one crashes
+DIST_BLEND = 0.5          # how far a new depth reading moves a track's distance
+DIST_JUMP = 0.4           # a reading this much (relative) off the current distance is doubted ...
+DIST_JUMPS = 3            # ... until it happens this many times in a row
+EDGE_VISIBLE = 0.75       # read an object's depth only while this much of its box is on screen
+EDGE_SLIVER = 0.15        # ... and not when it's a strip thinner than this at the edge
+DIST_FRESH = 0.6          # s: a distance read this recently is "measured", older is predicted
 NAMED_FRESH = 0.5         # s a named box keeps suppressing generic boxes on top of it
 VOTE_DECAY = 0.85         # older name votes fade by this much per new name
 
@@ -350,6 +368,9 @@ class Track:
         self.vel = np.zeros(2, np.float32)       # own motion on top of the camera's, picture fractions / s
         self.growth = 0.0                        # d ln(size) / dt, per s (+ = getting bigger)
         self.last_size = self.size
+        self.dist = None                         # metres to its near surface (depth.py)
+        self.dist_doubt = 0                      # depth readings in a row that disagreed
+        self.dist_t = -1e9                       # when depth was last read off the map
         self.hits = 1
         self.born = self.seen = self.updated = t
 
@@ -397,6 +418,28 @@ class Track:
         self.box = warp_boxes(self.box[None], step, size)[0]
         shift = self.vel * dt
         self.box += np.concatenate([shift, shift])
+        if self.dist is not None:                # growing on screen = getting nearer
+            x0, y0, x1, y1 = self.box
+            if min(x0, y0) > 0.02 and max(x1, y1) < 0.98:
+                self.dist *= math.exp(-max(-2.0, min(2.0, self.growth)) * dt)
+            else:                                # cut off by the edge, its size says nothing:
+                zoom = math.hypot(step[0, 0], step[1, 0])   # use how much the whole view zoomed
+                self.dist /= max(0.5, min(2.0, zoom))
+
+    def measure(self, z, t):
+        """A depth reading (m) for this track: smoothed in, one-off jumps doubted."""
+        if z is None or not math.isfinite(z):
+            return
+        self.dist_t = t
+        if self.dist is None:
+            self.dist, self.dist_doubt = z, 0
+        elif abs(z - self.dist) > DIST_JUMP * self.dist:
+            self.dist_doubt += 1
+            if self.dist_doubt >= DIST_JUMPS:        # it keeps saying so: it really moved
+                self.dist, self.dist_doubt = z, 0
+        else:
+            self.dist += DIST_BLEND * (z - self.dist)
+            self.dist_doubt = 0
 
     def correct(self, box, t, weight):
         dt = max(1e-3, t - self.seen)
@@ -412,8 +455,9 @@ class Track:
 
 
 class ObstacleTracker:
-    def __init__(self, camera="forward", model="tiny", log=print):
-        """model: "tiny" / "nano" (see detector.py), or None for unnamed boxes only."""
+    def __init__(self, camera="forward", model="tiny", log=print, depth="fast"):
+        """model: "tiny" / "nano" (see detector.py), or None for unnamed boxes only.
+        depth: "fast" / "fine" (see depth.py), or None for no distances."""
         self.camera = camera
         self.enabled = True
         self.tracks = []
@@ -425,6 +469,43 @@ class ObstacleTracker:
         self.blurry = False
         self.named = np.zeros((0, 4), np.float32)    # latest model boxes (moved with the camera)
         self.named_t = -1e9
+        self.depth = depthmod.AsyncDepth(depth, log) if depth else None
+        self.depth_map = None    # latest depthmod.DepthMap
+        self.ahead = None        # m to the nearest thing in the flight path (smoothed)
+
+    @property
+    def depth_status(self):
+        """(text, ok) for the HUD."""
+        if self.depth is None:
+            return "NO DEPTH", True
+        if self.depth.status == "ready":
+            return f"DEPTH {self.depth.ms:.0f} ms {self.depth.device}", True
+        return ("DEPTH LOADING" if self.depth.status == "loading" else "NO DEPTH"), False
+
+    def calibrate_depth(self, frame, true_distance):
+        """Camera square to a wall true_distance m away: returns the new scale, or None."""
+        return self.depth.calibrate(frame, true_distance) if self.depth else None
+
+    def _measure(self, dm, size):
+        """A new depth map: read every track's distance off it, and the distance ahead."""
+        self.depth_map = dm
+        m = self.motion.since(dm.t)                  # depth map's frame -> now
+        if m is None:
+            return
+        back = np.linalg.inv(m)                      # now -> the depth map's frame
+        for tr in self.tracks:
+            whole = warp_boxes(tr.box[None], back, size)[0]
+            box = np.clip(whole, 0, 1)
+            # mostly off screen: the middle of what's left is often the background - don't read it,
+            # keep carrying the distance forward by box growth instead
+            # and a thin sliver at the edge is the last bit of something leaving the view
+            at_edge = min(box[0], box[1]) < 0.02 or max(box[2], box[3]) > 0.98
+            sliver = at_edge and min(box[2] - box[0], box[3] - box[1]) < EDGE_SLIVER
+            if area(box) >= EDGE_VISIBLE * max(area(whole), 1e-9) and not sliver:
+                tr.measure(dm.box(box), dm.t)
+        a = dm.ahead()
+        self.ahead = a if self.ahead is None or abs(a - self.ahead) > 0.5 * self.ahead else \
+            self.ahead + DIST_BLEND * (a - self.ahead)
 
     @property
     def model_status(self):
@@ -454,6 +535,12 @@ class ObstacleTracker:
         for tr in self.tracks:
             tr.predict(t, step, size)
         self.named = warp_boxes(self.named, step, size)
+        if self.depth:
+            if not self.blurry:
+                self.depth.submit(frame, t)
+            dm = self.depth.poll(self.motion, size)
+            if dm is not None:
+                self._measure(dm, size)
 
         dets, labels = np.zeros((0, 4), np.float32), []      # labels: (name, score, from the model)
         if self.namer:
@@ -545,21 +632,38 @@ class ObstacleTracker:
             return False
         x0, _, x1, _ = tr.box
         in_path = x1 > 0.5 - CORRIDOR / 2 and x0 < 0.5 + CORRIDOR / 2
-        near = tr.box[3] - tr.box[1] >= NEAR
+        near = tr.dist * SAFETY < NEAR_M if tr.dist is not None else tr.box[3] - tr.box[1] >= NEAR
         return bool(in_path and (near or (tr.ttc is not None and tr.ttc < TTC_WARN)))
 
     def objects(self):
-        """Confirmed tracks for the HUD: dicts with id, label, box (x0 y0 x1 y1 fractions), ttc, threat.
+        """Confirmed tracks: dicts with id, label, box (x0 y0 x1 y1 fractions), ttc, threat, and with
+        depth: dist (m to its near surface), xyz (m: right, down, forward), bearing (deg right).
         Unnamed (or not yet surely named) things are only listed while they're in the way, as
         "obstacle"."""
         out = []
+        cam = self.depth.camera if self.depth else None
         for tr in self.tracks:
             threat = self.is_threat(tr)
             if tr.hits >= CONFIRM and (tr.named or threat):
-                out.append({"id": tr.id, "label": tr.label if tr.named else "obstacle",
-                            "box": tuple(float(v) for v in tr.box), "ttc": tr.ttc, "threat": threat,
-                            "lost": tr.seen != tr.updated})
+                o = {"id": tr.id, "label": tr.label if tr.named else "obstacle",
+                     "box": tuple(float(v) for v in tr.box), "ttc": tr.ttc, "threat": threat,
+                     "lost": tr.seen != tr.updated, "dist": tr.dist, "xyz": None, "bearing": None,
+                     # what to plan with: the distance with the safety margin taken off
+                     "dist_safe": None if tr.dist is None else tr.dist * SAFETY,
+                     # measured off a depth map just now (else carried forward by prediction)
+                     "dist_fresh": tr.dist is not None and tr.updated - tr.dist_t < DIST_FRESH}
+                if tr.dist is not None and cam is not None:
+                    u, v = (float(c) for c in tr.center)
+                    x, y, z = cam.point(u, v, tr.dist)
+                    o["xyz"] = (x, y, z)
+                    o["bearing"] = math.degrees(math.atan2(x, z))
+                out.append(o)
         return out
+
+    def ahead_info(self):
+        """(m to the nearest thing in the flight path or None, whether that's a threat).
+        The threat test uses the safety margin (SAFETY); the distance is the plain estimate."""
+        return self.ahead, self.ahead is not None and self.camera == "forward" and self.ahead * SAFETY < NEAR_M
 
 
 def on_screen(box):
