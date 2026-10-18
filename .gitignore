@@ -1,4 +1,7 @@
 node_modules/
 .cert/
 .env
-xray/firmware/xray/secrets.h
+esp32/*/secrets.h
+ios/*.xcodeproj/
+ios/build/
+paths/

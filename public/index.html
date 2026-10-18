@@ -5,12 +5,40 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>VisionAiry</title>
   <link rel="stylesheet" href="style.css" />
+  <style>
+    #join { display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; }
+    .join { text-align: center; font-size: 0.8rem; }
+    .join .qr { background: #fff; padding: 10px; display: inline-block; }
+    .join a { color: var(--hud-dim); word-break: break-all; }
+  </style>
 </head>
 <body class="menu">
   <h1>VISION<span>AIRY</span></h1>
-  <p class="sub">Distributed aperture system // DIY edition</p>
-  <a class="big" href="/headset">HEADSET<small>phone in the cardboard box</small></a>
-  <a class="big" href="/camera">ROOM CAMERA<small>phone / laptop mounted around the room</small></a>
-  <a class="big" href="/control">CONTROL<small>open on the server laptop: join codes, coverage map, tuning</small></a>
+  <p class="sub">Throw tracker // DIY edition</p>
+  <div id="join"></div>
+  <a class="big" href="/headset">HEADSET<small>on this device (phone, or laptop webcam)</small></a>
+  <a class="big" href="/graph">3D GRAPH<small>live beacon + camera positions, on the laptop</small></a>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script>
+    // On the laptop, show a QR code per network address so the phone can open the headset without typing
+    if (!/^(localhost|127\.)/.test(location.hostname)) {
+      document.getElementById('join').remove();
+    } else {
+      fetch('/ips.json').then((r) => r.json()).then(({ ips, port }) => {
+        const box = document.getElementById('join');
+        if (!ips.length) box.textContent = 'No network connection';
+        for (const ip of ips) {
+          const url = `https://${ip}:${port}/headset`;
+          const div = document.createElement('div');
+          div.className = 'join';
+          div.innerHTML = `<div class="qr"></div><p>Scan with the phone camera</p><a href="${url}">${url}</a>`;
+          box.appendChild(div);
+          if (window.QRCode) new QRCode(div.querySelector('.qr'), { text: url, width: 220, height: 220 });
+          else div.querySelector('.qr').remove();
+        }
+      });
+    }
+  </script>
 </body>
 </html>

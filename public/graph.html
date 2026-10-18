@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VisionAiry Graph</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    html, body { overflow: hidden; }
+    #view { position: fixed; inset: 0; }
+    #panel { position: fixed; top: 12px; left: 12px; background: rgba(0, 12, 4, 0.85); border: 1px solid var(--hud-dim); padding: 12px 14px; font-size: 0.85rem; line-height: 1.6; min-width: 250px; }
+    #panel h2 { margin: 0 0 6px; font-size: 0.9rem; letter-spacing: 0.25em; }
+    #panel .row { display: flex; justify-content: space-between; gap: 14px; }
+    #panel .row span:first-child { color: var(--hud-dim); }
+    #panel .bcn { color: #ffd23f; }
+    #panel .cam { color: #6bb8ff; }
+    #panel button { padding: 6px 10px; font-size: 0.75rem; margin: 8px 6px 0 0; }
+    #panel .note { color: var(--hud-dim); font-size: 0.7rem; margin-top: 8px; max-width: 260px; }
+    .label { font: 12px Menlo, monospace; color: #fff; text-shadow: 0 0 4px #000; white-space: nowrap; }
+  </style>
+  <script type="importmap">
+    { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    } }
+  </script>
+</head>
+<body>
+  <div id="view"></div>
+  <div id="panel">
+    <h2>3D GRAPH</h2>
+    <div class="row"><span>LINK</span><span id="link">--</span></div>
+    <div class="row"><span>STATE</span><span id="phase">--</span></div>
+    <div class="row bcn"><span>BEACON</span><span id="bcn">--</span></div>
+    <div class="row cam"><span>CAMERA</span><span id="cam">--</span></div>
+    <div class="row"><span>DISTANCE</span><span id="dist">--</span></div>
+    <button id="clear">CLEAR TRAILS</button><button id="reset">RESET VIEW</button>
+    <div class="note">Origin = calibration spot. X right, Y along the IMU's arrow, Z up, metres. Positions are dead reckoned and drift; re-zero on the headset (beacon touching the phone, hold the screen).</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+    // The graph frame is Z-up, so make three.js Z-up too and use its coordinates directly
+    THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
+
+    const TRAIL_SECONDS = 10;
+    const MAX_POINTS = 2000;
+    const $ = (id) => document.getElementById(id);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 100);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(devicePixelRatio);
+    $('view').appendChild(renderer.domElement);
+    const labels = new CSS2DRenderer();
+    labels.domElement.style.position = 'fixed';
+    labels.domElement.style.inset = '0';
+    labels.domElement.style.pointerEvents = 'none';
+    $('view').appendChild(labels.domElement);
+    const controls = new OrbitControls(camera, renderer.domElement);
+
+    function resetView() {
+      camera.position.set(-2.2, -2.6, 1.8);
+      controls.target.set(0, 0.4, 0.3);
+      controls.update();
+    }
+    resetView();
+    $('reset').onclick = resetView;
+
+    function resize() {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      labels.setSize(innerWidth, innerHeight);
+    }
+    addEventListener('resize', resize);
+    resize();
+
+    function label(text, color = '#fff') {
+      const div = document.createElement('div');
+      div.className = 'label';
+      div.style.color = color;
+      div.textContent = text;
+      return new CSS2DObject(div);
+    }
+
+    // --- Static scene: floor grid on Z = 0 and the origin axes
+    const grid = new THREE.GridHelper(4, 16, 0x1c7a35, 0x0d3a19);
+    grid.rotation.x = Math.PI / 2; // GridHelper lies in XZ; turn it into the XY plane
+    scene.add(grid);
+    scene.add(new THREE.AxesHelper(0.5));
+    for (const [pos, name, color] of [[[0.58, 0, 0], 'X', '#ff6b6b'], [[0, 0.58, 0], 'Y', '#39ff6a'], [[0, 0, 0.58], 'Z', '#6bb8ff']]) {
+      const l = label(name, color);
+      l.position.set(...pos);
+      scene.add(l);
+    }
+    const originLabel = label('ORIGIN (calibration spot)', '#1c7a35');
+    originLabel.position.set(0, 0, -0.06);
+    scene.add(originLabel);
+
+    // --- A trail: a line whose points we keep appending, with per-vertex colour
+    function makeTrail(color) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_POINTS * 3), 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(MAX_POINTS * 3), 3));
+      geo.setDrawRange(0, 0);
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ vertexColors: true }));
+      scene.add(line);
+      return { line, geo, pts: [], color: new THREE.Color(color) };
+    }
+    const FLY = new THREE.Color(0xffd23f);
+    function pushTrail(tr, p, now, flying) {
+      tr.pts.push({ p, t: now, c: flying ? FLY : tr.color });
+      while (tr.pts.length > MAX_POINTS || (tr.pts.length && now - tr.pts[0].t > TRAIL_SECONDS * 1000)) tr.pts.shift();
+      const pos = tr.geo.attributes.position, col = tr.geo.attributes.color;
+      tr.pts.forEach((q, i) => {
+        pos.setXYZ(i, ...q.p);
+        // Older points fade toward black
+        const k = Math.max(0.15, 1 - (now - q.t) / (TRAIL_SECONDS * 1000));
+        col.setXYZ(i, q.c.r * k, q.c.g * k, q.c.b * k);
+      });
+      pos.needsUpdate = col.needsUpdate = true;
+      tr.geo.setDrawRange(0, tr.pts.length);
+      tr.geo.computeBoundingSphere();
+    }
+    function clearTrail(tr) {
+      tr.pts = [];
+      tr.geo.setDrawRange(0, 0);
+    }
+
+    // --- Beacon: a small board, oriented by its quaternion, with a drop line to the floor
+    const beacon = new THREE.Group();
+    const board = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.08, 0.012), new THREE.MeshBasicMaterial({ color: 0xffd23f }));
+    board.add(new THREE.LineSegments(new THREE.EdgesGeometry(board.geometry), new THREE.LineBasicMaterial({ color: 0x000000 })));
+    const arrow = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, 0, 0.007), 0.07, 0x000000, 0.02, 0.015);
+    board.add(arrow); // the IMU's Y arrow
+    beacon.add(board);
+    beacon.visible = false;
+    scene.add(beacon);
+    const beaconLabel = label('BEACON', '#ffd23f');
+    beaconLabel.position.set(0, 0, 0.07);
+    beacon.add(beaconLabel);
+    const bTrail = makeTrail(0x39ff6a);
+    const drop = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+      new THREE.LineDashedMaterial({ color: 0x1c7a35, dashSize: 0.03, gapSize: 0.02 }));
+    scene.add(drop);
+
+    // --- Phone camera: body + view frustum, oriented by its device axes
+    const phone = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.15, 0.008), new THREE.MeshBasicMaterial({ color: 0x6bb8ff }));
+    body.add(new THREE.LineSegments(new THREE.EdgesGeometry(body.geometry), new THREE.LineBasicMaterial({ color: 0x000000 })));
+    phone.add(body);
+    // Frustum out of the back of the phone (device -Z), ~65° wide, 0.35 m long
+    const d = 0.35, hw = d * Math.tan(32.5 * Math.PI / 180), hh = hw * 0.56;
+    const corners = [[hw, hh], [-hw, hh], [-hw, -hh], [hw, -hh]].map(([x, y]) => new THREE.Vector3(x, y, -d));
+    const fr = [];
+    for (let i = 0; i < 4; i++) fr.push(new THREE.Vector3(), corners[i], corners[i], corners[(i + 1) % 4]);
+    phone.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(fr), new THREE.LineBasicMaterial({ color: 0x6bb8ff })));
+    phone.matrixAutoUpdate = false;
+    phone.visible = false;
+    scene.add(phone);
+    const phoneLabel = label('CAMERA', '#6bb8ff');
+    scene.add(phoneLabel);
+    const pTrail = makeTrail(0x6bb8ff);
+
+    // Line of sight between them
+    const sight = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+      new THREE.LineDashedMaterial({ color: 0x555555, dashSize: 0.05, gapSize: 0.04 }));
+    scene.add(sight);
+
+    // --- Live data
+    const live = { bcn: null, cam: null, beat: null };
+    const fmt = (v) => (v >= 0 ? '+' : '') + v.toFixed(2);
+    const xyz = (p) => `${fmt(p[0])} ${fmt(p[1])} ${fmt(p[2])}`;
+
+    function setLine(line, a, b) {
+      line.geometry.setFromPoints([new THREE.Vector3(...a), new THREE.Vector3(...b)]);
+      line.computeLineDistances();
+    }
+
+    function connect() {
+      const ws = new WebSocket(`wss://${location.host}/ws`);
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        const now = performance.now();
+        if (msg.type === 'bstate') {
+          live.bcn = { ...msg, at: now };
+          beacon.visible = true;
+          beacon.position.set(...msg.p);
+          board.quaternion.set(msg.q[1], msg.q[2], msg.q[3], msg.q[0]); // ours is w,x,y,z; three wants x,y,z,w
+          if (msg.cal) pushTrail(bTrail, msg.p, now, msg.air);
+          setLine(drop, msg.p, [msg.p[0], msg.p[1], 0]);
+        } else if (msg.type === 'phone') {
+          live.cam = { ...msg, at: now };
+          phone.visible = true;
+          const m = new THREE.Matrix4().makeBasis(new THREE.Vector3(...msg.x), new THREE.Vector3(...msg.y), new THREE.Vector3(...msg.z));
+          m.setPosition(...msg.p);
+          phone.matrix.copy(m);
+          phone.matrixWorldNeedsUpdate = true;
+          phoneLabel.position.set(msg.p[0], msg.p[1], msg.p[2] + 0.12);
+          pushTrail(pTrail, msg.p, now, false);
+        } else if (msg.type === 'beacon') {
+          live.beat = msg.online === false ? null : { ...msg, at: now };
+        } else if (msg.type === 'imu' && (msg.event === 'zero' || msg.event === 'cal')) {
+          clearTrail(bTrail);
+          clearTrail(pTrail);
+        }
+      };
+      ws.onclose = () => setTimeout(connect, 1000);
+    }
+    connect();
+
+    $('clear').onclick = () => { clearTrail(bTrail); clearTrail(pTrail); };
+
+    function updatePanel(now) {
+      const beat = live.beat && now - live.beat.at < 3000 ? live.beat : null;
+      $('link').textContent = !beat ? 'NO BEACON' : beat.link === 'usb' ? 'USB' : `WI-FI ${beat.rssi} dBm`;
+      const b = live.bcn && now - live.bcn.at < 1000 ? live.bcn : null;
+      $('phase').textContent = !b ? '--' : !b.cal ? 'UNCALIBRATED' : b.air ? 'FLIGHT' : b.still ? 'STILL' : 'MOVING';
+      $('bcn').textContent = b ? xyz(b.p) : '--';
+      const c = live.cam && now - live.cam.at < 1000 ? live.cam : null;
+      $('cam').textContent = c ? xyz(c.p) : 'open /headset on the phone';
+      sight.visible = !!(b && c);
+      if (b && c) {
+        setLine(sight, b.p, c.p);
+        $('dist').textContent = Math.hypot(b.p[0] - c.p[0], b.p[1] - c.p[1], b.p[2] - c.p[2]).toFixed(2) + ' m';
+      } else {
+        $('dist').textContent = '--';
+      }
+    }
+
+    renderer.setAnimationLoop((t) => {
+      controls.update();
+      updatePanel(performance.now());
+      renderer.render(scene, camera);
+      labels.render(scene, camera);
+    });
+  </script>
+</body>
+</html>

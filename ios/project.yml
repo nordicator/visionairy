@@ -1,0 +1,21 @@
+name: VisionAiryAR
+options:
+  bundleIdPrefix: com.cdx
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  VisionAiryAR:
+    type: application
+    platform: iOS
+    sources: [VisionAiryAR]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ca.smallwoken.vision
+        DEVELOPMENT_TEAM: Y3B7W354V4
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_FILE: VisionAiryAR/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
+        # The laptop running server.js; build.sh fills this in with the laptop's current address
+        VA_SERVER_HOST: 127.0.0.1
