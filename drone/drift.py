@@ -96,6 +96,7 @@ class AutoTrim:
         self.pilot = pilot
         self.enabled = enabled
         self.state = "off"      # off | waiting | calibrating | learning | steady | paused | low texture
+        self.skip = set()       # axes not to trim (the supervisor found the estimate reversed there)
 
     def update(self, est, dt, airborne_for, idle_for):
         """airborne_for: s since take off (None on the ground); idle_for: s since the last movement key."""
@@ -113,6 +114,8 @@ class AutoTrim:
             boost = CALIBRATE_GAIN if calibrating else 1.0
             moving = False
             for axis in AXES:
+                if axis in self.skip:
+                    continue
                 v = est.vel[axis]
                 if abs(v) > DEADBAND:
                     lim = TRIM_MAX_RATE * boost

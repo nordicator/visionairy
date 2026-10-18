@@ -40,6 +40,10 @@ import threading
 import time
 from collections import deque
 
+import ai_pilot
+import calibration
+import flightlog
+import supervisor
 from protocol import (A_CONTROL_OFF, A_HEARTBEAT, A_IP, A_CTRL_PORT, A_RTSP, B_CMD_CONTROL_OFF,
                       B_CMD_START, B_HELLO, B_IP, B_PORT, BReceiver, CENTER, FLAG_GYRO_CAL, FLAG_HEADLESS, FLAG_LAND,
                       FLAG_STOP, FLAG_TAKEOFF, SPEED_RANGES, Sticks, T_ACK, T_CTLMSG, T_FRAG,
@@ -62,6 +66,7 @@ MEDIA_DIR = os.path.join(HERE, "media")
 TRIM_FILE = os.path.join(HERE, "trim.json")
 PULSE_SECONDS = {FLAG_TAKEOFF: 1.0, FLAG_LAND: 1.0, FLAG_STOP: 1.0, FLAG_GYRO_CAL: 2.0}
 ACTION_KEYS = {ord("t"): FLAG_TAKEOFF, ord("l"): FLAG_LAND, ord(" "): FLAG_STOP, ord("c"): FLAG_GYRO_CAL}
+AI_ACTIONS = {"takeoff": FLAG_TAKEOFF, "land": FLAG_LAND, "stop": FLAG_STOP, "gyro": FLAG_GYRO_CAL}
 ACTION_NAMES = {FLAG_TAKEOFF: "take off", FLAG_LAND: "land", FLAG_STOP: "motors off",
                 FLAG_GYRO_CAL: "gyro calibrate"}
 
@@ -149,9 +154,17 @@ class Pilot:
         self.level = dict.fromkeys(AXES, 0.0)   # -100..100 % of stick range
         self.trim = dict.fromkeys(AXES, 0.0)    # % offset added to every stick, cancels drift
         self.speed = 1                          # app speed mode 1-3: right-stick range (SPEED_RANGES)
-        self.steering = False                   # click-to-go is driving: ignore the speed mode
+        self.steering = False                   # click-to-go / AI is driving: ignore the speed mode
         self.headless = False                   # drone's headless mode: sticks relative to the pilot
+        self.yaw = 0.0                          # -100..100 %, only the AI pilot turns
+        self.source = None                      # AI plan: now -> levels or None, read at send time
+        self.hold = {"x": 0.0, "y": 0.0}        # position-hold correction (supervisor.py), % stick
+        self.invert = {"x": False, "y": False, "yaw": False}   # axes this drone reverses (calibration.py)
         self._pulses = {}                       # flag -> expires
+
+    def set_hold(self, hold):
+        with self.lock:
+            self.hold = dict(hold)
 
     def set_speed(self, speed):
         with self.lock:
@@ -160,6 +173,7 @@ class Pilot:
     def update(self, held, dt):
         with self.lock:
             self.steering = False
+            self.yaw = 0.0
             for axis, d in held.items():
                 v = self.level[axis]
                 if d == 0:
@@ -171,14 +185,21 @@ class Pilot:
                 self.level[axis] = v
 
     def steer(self, levels):
-        """Set the sticks directly (click-to-go), -100..100 % per axis of the full stick range."""
+        """Set the sticks directly (click-to-go, AI), -100..100 % per axis of the full stick range.
+        An optional "yaw" entry turns."""
+        levels = dict(levels)
         with self.lock:
             self.steering = True
+            self.yaw = levels.pop("yaw", 0.0)
             self.level.update(levels)
 
     def levels(self):
         with self.lock:
             return dict(self.level)
+
+    def yaw_level(self):
+        with self.lock:
+            return self.yaw
 
     def trims(self):
         with self.lock:
@@ -208,13 +229,24 @@ class Pilot:
 
     def sticks(self):
         s = Sticks()                            # throttle 128 = hold altitude
+        # an AI plan is read here, when the packet goes out, so its timing doesn't depend on the
+        # video loop keeping up
+        plan = self.source(time.time()) if self.source else None
         with self.lock:
             for axis, name in AXES.items():
                 # like the app, the speed mode only limits the right stick (roll/pitch) the pilot
                 # moves; trim and the throttle stay on the full range
-                reach = 127 if axis == "z" or self.steering else SPEED_RANGES[self.speed]
-                v = self.level[axis] * reach / 127 + self.trim[axis]
+                if plan is not None:
+                    v = plan[axis] + self.trim[axis]
+                else:
+                    reach = 127 if axis == "z" or self.steering else SPEED_RANGES[self.speed]
+                    v = self.level[axis] * reach / 127 + self.trim[axis]
+                v += self.hold.get(axis, 0.0)
+                if self.invert.get(axis):
+                    v = -v
                 setattr(s, name, CENTER + round(max(-100.0, min(100.0, v)) / 100 * 127))
+            yaw = self.yaw if plan is None else plan["yaw"]
+            s.yaw = ai_pilot.yaw_byte(-yaw if self.invert.get("yaw") else yaw)
         # headless rides in every packet while it's on, like the app's toggle (protocol.FLAG_HEADLESS)
         s.flags = self.action()[0] | (FLAG_HEADLESS if self.headless else 0)
         return s
@@ -236,6 +268,13 @@ class Link:
         self.quality = None      # Variant B JPEG quality of the latest frame
         self.wifi = None         # (ssid, signal %) on Windows
         self.rx = BReceiver()
+        self.ai = None           # ai_pilot.Bridge when flying with --ai
+        self.agent = None        # ai_pilot.Agent
+        self.sup = None          # supervisor.Supervisor (obstacle guard + position hold)
+        self.depth_trust = None  # supervisor.DepthTrust: how far to believe the camera distances
+        self.obs = None          # the video loop's ObstacleTracker (objects, depth)
+        self.flying = False      # taken off and not landed (mirrors the video loop's flight_start)
+        self.cal = calibration.default()
 
     def log(self, *a):
         print(time.strftime("%H:%M:%S"), *a, flush=True)
@@ -274,6 +313,22 @@ class Link:
             except (OSError, subprocess.SubprocessError):
                 self.wifi = None
             time.sleep(3)
+
+    def depth_info(self):
+        """What's known about the depth setup, for supervisor.DepthTrust."""
+        obs = self.obs
+        d = obs.depth if obs is not None else None
+        if d is None:
+            return {"available": False, "status": "depth is off (--depth off)" if obs is not None else "starting"}
+        if d.status != "ready" or d.model is None:
+            return {"available": False, "status": f"depth model {d.status} (needs onnxruntime + the model file)"}
+        cal = d.model.cal or {}
+        try:
+            age = (time.time() - os.path.getmtime(depth.CAL_FILE)) / 86400
+        except OSError:
+            age = None
+        return {"available": True, "lens_guessed": d.camera.guessed, "cal_samples": len(cal.get("samples", [])),
+                "scale": cal.get("scale", 1.0), "cal_age_days": age}
 
     # ---------------- Variant A ----------------
     def run_a(self):
@@ -409,13 +464,17 @@ class Link:
         show_keys = False                # the key list (?), hidden by default
         show_depth = False
         last_t = time.time()
-        est = drift.DriftEstimator(self.camera)
+        est = calibration.Calibrated(drift.DriftEstimator(self.camera), self.cal)
         auto = drift.AutoTrim(self.pilot, self.autotrim)
+        if self.sup:
+            self.sup.autotrim = auto
         self.pilot.set_trims(drift.load_trim(TRIM_FILE))
         saved_trim = self.pilot.trims()
         last_input = last_drift_log = 0.0
         goto = target.ClickTarget(self.camera)
         obs = obstacles.ObstacleTracker(self.camera, self.model, self.log, self.depth)
+        self.obs = obs
+        goto_stop = None                # (object id, stop when its cautious distance <= this m) for AI fly_to
         obs.enabled = self.objects
         clicks = []                     # (button, canvas x, canvas y) from the mouse callback
 
@@ -427,14 +486,17 @@ class Link:
             toasts.append((msg, time.time() + 2.5))
             del toasts[:-3]
             self.log(msg)
+            flightlog.event("toast", msg=msg)
 
         def stamp():
             return time.strftime("%Y%m%d_%H%M%S")
 
+        last_status, last_tel = None, 0.0
         cv2.namedWindow(WINDOW)
         cv2.setMouseCallback(WINDOW, on_mouse)
         focused = False
-        while self.running:
+        quit_ui = False                 # ESC / window closed: leave the loop but keep the radio up,
+        while self.running and not quit_ui:     # so main() can still land the drone
             now = time.time()
             if self.frames != shown and self.latest_jpeg:
                 shown = self.frames
@@ -459,6 +521,50 @@ class Link:
             if age is None or age > 0.5:
                 est.valid = False
             airborne = None if flight_start is None else now - flight_start
+            ai = self.ai if self.fly else None
+            if ai:
+                for msg in ai.take_notes():
+                    toast(msg)
+                for req in ai.take_requests():
+                    if req[0] == "action":
+                        flag = AI_ACTIONS[req[1]]
+                        if goto.active and flag in (FLAG_LAND, FLAG_STOP):
+                            goto.cancel()
+                        self.pilot.pulse(flag)
+                        if flag == FLAG_TAKEOFF:
+                            flight_start = flight_start or now
+                        elif flag in (FLAG_LAND, FLAG_STOP):
+                            flight_start = None
+                        flightlog.event("action", what=ACTION_NAMES[flag], source="ai")
+                        toast(f"AI: {ACTION_NAMES[flag]}")
+                    elif req[0] == "trim":
+                        self.pilot.set_trims(req[1])
+                        if req[2] is not None:
+                            auto.enabled = bool(req[2])
+                    elif req[0] == "goto" and img is not None and flight_start is not None:
+                        goto.set(req[1], req[2], now)
+                        goto_stop = (req[3], req[4]) if len(req) > 4 and req[4] else None
+                        toast("AI: flying to target")
+                airborne = None if flight_start is None else now - flight_start
+                if ai.driving():
+                    if any(held.values()):
+                        ai.abort("pilot took over")
+                    elif age is None or age > 1.0:
+                        ai.abort("video lost")
+                objs = obs.objects() if obs.enabled and img is not None else None
+                ahead = obs.ahead_info() if obs.enabled and img is not None and obs.depth else None
+                self.pilot.set_hold(self.sup.update(now, airborne, any(held.values()) or "shift" in pressed,
+                                                    goto.active, age, est.vel, est.valid, objs, ahead))
+                self.depth_trust.update(now, ahead[0] if ahead else None, self.sup.hold_state == "holding")
+                if goto.active and goto_stop:              # AI fly_to with a stop distance (camera depth)
+                    target_obj = next((o for o in objs or [] if o["id"] == goto_stop[0]), None)
+                    if target_obj and target_obj.get("dist_safe") is not None and target_obj["dist_safe"] <= goto_stop[1]:
+                        goto.cancel("arrived")
+                        flightlog.event("fly_to_stop", object=goto_stop[0], dist=target_obj["dist"],
+                                        dist_safe=target_obj["dist_safe"], stop_at=goto_stop[1])
+                        toast(f"AI: stopped ~{target_obj['dist']:.1f} m from #{goto_stop[0]} (camera estimate)")
+                if not goto.active:
+                    goto_stop = None
             for button, cx, cy in clicks:
                 if not self.fly:
                     continue
@@ -491,9 +597,15 @@ class Link:
                     toast("go-to cancelled")
                 elif goto.active and age is not None and age > 1.5:
                     goto.cancel("lost")
+                ai_levels = ai.levels(now) if ai else None
                 if goto.active:
                     self.pilot.steer(goto.command(now, age is not None and age < 0.5))
                     last_input = now                    # auto-trim waits, then recalibrates
+                elif ai_levels is not None:
+                    self.pilot.steer(ai_levels)
+                    step = ai.progress(now)
+                    if step is None or step["kind"] != "hover":
+                        last_input = now                # auto-trim keeps learning in hover steps
                 else:
                     self.pilot.update(held, now - last_t)
                 if going == "tracking" and goto.state in ("arrived", "lost", "timeout"):
@@ -512,6 +624,7 @@ class Link:
                              f"(x {est.vel['x']:+.3f} y {est.vel['y']:+.3f} z {est.vel['z']:+.3f}) -> "
                              f"trim x {t['x']:+.1f} y {t['y']:+.1f} z {t['z']:+.1f}")
             last_t = now
+            self.flying = flight_start is not None
             trims = self.pilot.trims()
             if any(abs(trims[a] - saved_trim[a]) > 0.5 for a in trims):
                 drift.save_trim(TRIM_FILE, trims)
@@ -549,6 +662,33 @@ class Link:
                 if show_depth and obs.depth_map is not None and img is not None else None,
                 "toasts": [m for m, _ in reversed(toasts)],
             }
+            state["ai"] = None
+            if ai:
+                state["levels"]["yaw"] = self.pilot.yaw_level()
+                depth_now = self.depth_trust.status(state.get("ahead") if obs.depth else None)
+                ai.publish({**ai_pilot.summarize(state, goto.state, auto.enabled), **self.sup.status(), **depth_now})
+                state["ai"] = self.sup.hud(now, self.agent)
+                state["ai"]["depth"] = depth_now["depth"]
+                hold = self.sup.hold
+                state["levels"]["x"] += hold["x"]               # show the stick actually sent
+                state["levels"]["y"] += hold["y"]
+            if status[0] != last_status:
+                flightlog.event("link", status=status[0], age_ms=state["age_ms"], frames=self.frames)
+                last_status = status[0]
+            if now - last_tel >= supervisor.TEL_PERIOD:
+                last_tel = now
+                s = self.pilot.sticks()
+                flightlog.event("tel", airborne=state["flight"] is not None, flight_s=state["flight"],
+                                link=status[0], age_ms=state["age_ms"], fps=state["fps"],
+                                levels={k: round(v, 1) for k, v in state["levels"].items()},
+                                sticks=[s.roll, s.pitch, s.throttle, s.yaw, s.flags],
+                                trim={k: round(v, 1) for k, v in trims.items()}, auto=auto.state,
+                                drift={k: round(v, 4) for k, v in est.vel.items()}, drift_valid=est.valid,
+                                drift_points=est.points, goto=goto.state, keys=sorted(pressed),
+                                objects=[{"id": o["id"], "label": o["label"], "box": [round(v, 3) for v in o["box"]],
+                                          "ttc": None if o["ttc"] is None else round(o["ttc"], 2),
+                                          "threat": o["threat"]} for o in state["objects"] or []],
+                                **(self.sup.tel_fields(now) if ai else {}))
             canvas = hud.fit(img)
             hud.draw(canvas, state)
             cv2.imshow(WINDOW, canvas)
@@ -558,9 +698,12 @@ class Link:
                 k &= 0xFF
                 kb.saw(k)
             if k == 27:
-                self.running = False
+                quit_ui = True
             elif self.fly and k in ACTION_KEYS:
                 flag = ACTION_KEYS[k]
+                if ai:
+                    ai.abort(ACTION_NAMES[flag] + " key")
+                flightlog.event("action", what=ACTION_NAMES[flag], source="key")
                 self.pilot.pulse(flag)
                 if flag == FLAG_TAKEOFF:
                     flight_start = flight_start or now
@@ -607,6 +750,9 @@ class Link:
                 # switched on, whichever way it turns afterwards - point it away from you first
                 self.pilot.headless = not self.pilot.headless
                 toast("headless on - forward = away from you" if self.pilot.headless else "headless off")
+                flightlog.event("headless", on=self.pilot.headless)
+                if ai and self.pilot.headless:
+                    ai.abort("headless mode switched on")   # its plans assume forward = the nose
             elif k == ord("?") or k == ord("/"):
                 show_keys = not show_keys
             elif k == ord("z"):
@@ -622,7 +768,7 @@ class Link:
                 obs.enabled = not obs.enabled
                 toast("object tracking " + ("on" if obs.enabled else "off"))
             if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:   # closed with the X
-                self.running = False
+                quit_ui = True
         if writer:
             writer.release()
             self.log("recording saved")
@@ -651,7 +797,42 @@ def main():
     ap.add_argument("--hfov", type=float, metavar="DEG",
                     help="camera field of view for depth, until calibrate_camera.py has measured it "
                          "(default: 90 for the drone, 65 for a webcam)")
+    ap.add_argument("--no-calibration", action="store_true",
+                    help="ignore calibration.json (what preflight.py --fly measured)")
+    ap.add_argument("--first-flight", action="store_true",
+                    help="gentle settings for a first test: AI sticks 40%%, safe area 1.5 m, ceiling 1.6 m, "
+                         "flight limit 3 min, softer hold")
+    ap.add_argument("--ai", action="store_true",
+                    help="also take typed commands for an LLM pilot in this terminal (see ai_pilot.py)")
+    ap.add_argument("--ai-model", help="override SPAR_MODEL for --ai")
+    ap.add_argument("--ai-max-stick", type=float, default=60.0, help="AI stick cap in %% (default 60)")
+    ap.add_argument("--no-ai-vision", action="store_true", help="don't send camera frames to the AI")
+    ap.add_argument("--no-ai-guard", action="store_true", help="turn off the obstacle guard (stops AI plans)")
+    ap.add_argument("--no-ai-hold", action="store_true", help="turn off position hold while the AI hovers")
+    ap.add_argument("--ai-hold-gain", type=float, default=supervisor.HOLD_GAIN,
+                    help=f"hold: %% stick per frame-width/s of slide (default {supervisor.HOLD_GAIN:g})")
+    ap.add_argument("--ai-hold-max", type=float, default=supervisor.HOLD_MAX,
+                    help=f"hold: max correction in %% stick (default {supervisor.HOLD_MAX:g})")
+    ap.add_argument("--no-ai-gyro", action="store_true",
+                    help="don't calibrate the gyro automatically before the AI's first take off")
+    ap.add_argument("--ai-max-distance", type=float, default=3.0,
+                    help="refuse AI plans that go further than this from the take-off spot, m (0 = off)")
+    ap.add_argument("--ai-ceiling", type=float, default=2.0, help="refuse AI plans that climb above this, m (0 = off)")
+    ap.add_argument("--ai-lost-land", type=float, default=supervisor.LOST_LAND_S,
+                    help=f"land after this many s without video while flying (0 = never, default "
+                         f"{supervisor.LOST_LAND_S:g})")
+    ap.add_argument("--ai-max-flight", type=float, default=supervisor.FLIGHT_MAX_S,
+                    help=f"land after this many s of flight, battery (0 = never, default {supervisor.FLIGHT_MAX_S:g})")
+    ap.add_argument("--ai-hold-min", type=float, default=supervisor.HOLD_MIN,
+                    help=f"hold: smallest push in %% stick, below which the drone doesn't react "
+                         f"(default {supervisor.HOLD_MIN:g})")
     args = ap.parse_args()
+    if args.first_flight:
+        args.ai_max_stick = min(args.ai_max_stick, 40.0)
+        args.ai_max_distance = min(args.ai_max_distance or 1.5, 1.5)
+        args.ai_ceiling = min(args.ai_ceiling or 1.6, 1.6)
+        args.ai_max_flight = min(args.ai_max_flight or 180.0, 180.0)
+        args.ai_hold_gain = min(args.ai_hold_gain, 80.0)
 
     if args.webcam is not None and cv2 is None:
         sys.exit("The webcam test needs OpenCV: pip install opencv-python numpy")
@@ -676,6 +857,18 @@ def main():
     link = Link(variant, fly, args.save, args.verbose, args.camera, not args.no_autotrim, not args.no_objects,
                 None if args.model == "off" else args.model, None if args.depth == "off" else args.depth,
                 args.cal_distance)
+    if not args.no_calibration:
+        link.cal.update(calibration.load())
+        link.pilot.invert = dict(link.cal["invert"])
+    log_path = flightlog.LOG.open("flight")
+    flightlog.event("session", argv=sys.argv, args=vars(args), variant=variant, platform=sys.platform,
+                    python=sys.version.split()[0], opencv=getattr(cv2, "__version__", None))
+    link.log(f"flight log: {os.path.relpath(log_path)}  (read it with: python flightlog.py)")
+    flightlog.event("calibration", **link.cal)
+    if link.cal["measured"]:
+        link.log(f"calibration from {link.cal['measured']}: {calibration.describe(link.cal)}")
+    elif variant != "webcam":
+        link.log("no calibration yet: run  python preflight.py --fly  for a smoother flight")
     if variant == "webcam":
         link.log(f"webcam {args.webcam} test - no drone, no flight commands. ? shows the keys, ESC quits")
         threads = [threading.Thread(target=link.video_webcam, args=(args.webcam,), daemon=True)]
@@ -684,19 +877,66 @@ def main():
         threads = [threading.Thread(target=link.run_a if variant == "a" else link.run_b, daemon=True)]
     if fly:
         link.log("click the video window, then:", HELP)
+    if args.ai:
+        if not fly:
+            sys.exit("--ai needs fly mode (not probe or --webcam)")
+        llm = ai_pilot.LLM(model=args.ai_model)
+        llm.log = link.log
+        link.ai = ai_pilot.Bridge(args.ai_max_stick)
+        link.pilot.source = link.ai.levels
+        link.sup = supervisor.Supervisor(link.ai, args.camera, not args.no_ai_guard, not args.no_ai_hold,
+                                         args.ai_hold_gain, args.ai_hold_max, args.ai_hold_min,
+                                         args.ai_lost_land, args.ai_max_flight)
+        link.sup.pilot = link.pilot
+        link.depth_trust = supervisor.DepthTrust(link.depth_info)
+        link.agent = ai_pilot.Agent(llm, link.ai, lambda: link.latest_jpeg, not args.no_ai_vision, link.log,
+                                    ai_pilot.Envelope(args.ai_max_distance, args.ai_ceiling),
+                                    auto_gyro=not args.no_ai_gyro)
+        ai_pilot.start_console(link.agent, link.ai, lambda word: link.ai.request("action", word))
+        link.log(f"AI pilot: {llm.model or '(no SPAR_MODEL set)'} at {llm.base}, sticks capped at "
+                 f"{args.ai_max_stick:g}%, guard {'off' if args.no_ai_guard else 'on'}, "
+                 f"hold {'off' if args.no_ai_hold else 'on'}, vision {'off' if args.no_ai_vision else 'on'}")
     if variant == "a":
         threads.append(threading.Thread(target=link.video_a, daemon=True))
     if sys.platform == "win32" and variant != "webcam":
         threads.append(threading.Thread(target=link.wifi_monitor, daemon=True))
     for t in threads:
         t.start()
+    crash = None
     try:
         link.ui()
     except KeyboardInterrupt:
         pass
+    except Exception as e:                  # land first, then report the crash
+        flightlog.error("ui", e)
+        crash = e
+    if fly and link.flying:
+        land_before_exit(link, "program crashed" if crash else "quitting")
     link.running = False
     time.sleep(0.3)
     link.log(f"done, {link.frames} frames received")
+    flightlog.event("session_end", frames=link.frames)
+    if crash:
+        raise crash
+
+
+EXIT_LAND_WAIT = 3.5    # s the radio keeps running after a landing command on the way out
+
+
+def land_before_exit(link, why):
+    """Quitting (ESC, closing the window, Ctrl-C) or crashing mid-air: land before the radio stops."""
+    link.log(f"still flying while {why}: landing first (Ctrl-C again to skip)")
+    flightlog.event("exit_land", why=why)
+    if link.ai:
+        link.ai.abort(f"program {why}")
+    link.pilot.source = None
+    link.pilot.set_hold({"x": 0.0, "y": 0.0})
+    link.pilot.update(dict.fromkeys(AXES, 0), 0.0)
+    link.pilot.pulse(FLAG_LAND)
+    try:
+        time.sleep(EXIT_LAND_WAIT)
+    except KeyboardInterrupt:
+        link.log("skipped the landing wait")
 
 
 if __name__ == "__main__":
