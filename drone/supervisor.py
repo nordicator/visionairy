@@ -11,8 +11,9 @@ fixes what it can by itself:
                   it pushes against any slide the video measures. A steady drift builds up an
                   integral term (so it ends up cancelled, not just resisted, and nothing is saved to
                   trim.json), and something closing in ahead makes it back away. It also holds through
-                  the take-off step and while landing. It pauses after turns (a turn looks like a
-                  sideways slide) and whenever it can't trust the video.
+                  the take-off step, but lets go while landing (sticks centred, the drone's own
+                  auto-land). It pauses after turns (a turn looks like a sideways slide) and whenever
+                  it can't trust the video.
   Self-checks     Per axis (x = sideways, y = forward/back):
                   - wobbling back and forth -> its gain is cut
                   - the slide growing although it pushes against it (the estimate's direction is
@@ -98,7 +99,7 @@ class Axis:
 
 
 class Supervisor:
-    def __init__(self, bridge, camera="forward", guard=True, hold=True, hold_gain=HOLD_GAIN,
+    def __init__(self, bridge, camera="forward", guard=False, hold=True, hold_gain=HOLD_GAIN,
                  hold_max=HOLD_MAX, hold_min=HOLD_MIN, lost_land_s=LOST_LAND_S, flight_max_s=FLIGHT_MAX_S,
                  flight_warn_s=FLIGHT_WARN_S):
         self.bridge, self.camera = bridge, camera
@@ -247,7 +248,11 @@ class Supervisor:
         reason = None
         if not self.hold_on:
             state = "off"
-        elif airborne_for is None and not descending:
+        elif descending or (prog is not None and prog["kind"] == "land"):
+            # Hands off while it comes down: the descent makes furniture look like it's closing in and
+            # fools the slide estimate, and pushing on those made it land crooked. Its auto-land is straight.
+            state, reason = "waiting", "landing"
+        elif airborne_for is None:
             state, reason = "waiting", "on the ground"
         elif airborne_for is not None and airborne_for < HOLD_AFTER_TAKEOFF:
             state, reason = "waiting", "leaving the ground"
@@ -270,7 +275,7 @@ class Supervisor:
             k = 1.0 if dt <= 0 else min(1.0, dt / HOLD_TAU)
             closing = [o for o in objects or [] if not o["lost"] and _in_path(o)
                        and (o["threat"] or (o.get("ttc") is not None and o["ttc"] < BACKOFF_TTC))]
-            if closing and self.camera == "forward":
+            if closing and self.camera == "forward" and self.guard_on:   # backing away is part of the guard
                 backing = min(closing, key=lambda o: o["ttc"] if o.get("ttc") is not None else 0.0)
             for a, ax in self.axes.items():
                 v = -est_vel[a] if ax.flipped else est_vel[a]

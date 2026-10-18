@@ -55,6 +55,7 @@ try:
     import numpy as np
     import drift
     import follow
+    import orbit
     import hud
     import obstacles
     import depth
@@ -471,10 +472,14 @@ class Link:
         auto = drift.AutoTrim(self.pilot, self.autotrim)
         if self.sup:
             self.sup.autotrim = auto
-        self.pilot.set_trims(drift.load_trim(TRIM_FILE))
-        saved_trim = self.pilot.trims()
+        # Only trim set by hand (SHIFT + key, BACKSPACE) is saved. Auto-trim's learning lasts one flight:
+        # saving it made every flight start further off (see drift.py).
+        manual_trim = drift.load_trim(TRIM_FILE)
+        self.pilot.set_trims(manual_trim)
         last_input = last_drift_log = 0.0
         goto = target.ClickTarget(self.camera)
+        orb = orbit.Orbit(depth.CAMERA_HFOV)
+        seen_overrides = 0              # ai.overrides: bumps when "stop" etc. aborts the AI
         tracker = follow.PathFollower(follow.ServerFeed(self.server, log=self.log)) if self.fly else None
         obs = obstacles.ObstacleTracker(self.camera, self.model, self.log, self.depth)
         self.obs = obs
@@ -527,13 +532,20 @@ class Link:
             airborne = None if flight_start is None else now - flight_start
             ai = self.ai if self.fly else None
             if ai:
+                if ai.overrides != seen_overrides:  # the AI was stopped: its orbit / fly-to stop too
+                    seen_overrides = ai.overrides
+                    if orb.active or goto.active:
+                        orb.cancel()
+                        goto.cancel()
+                        self.pilot.steer(dict.fromkeys(AXES, 0.0))
                 for msg in ai.take_notes():
                     toast(msg)
                 for req in ai.take_requests():
                     if req[0] == "action":
                         flag = AI_ACTIONS[req[1]]
-                        if goto.active and flag in (FLAG_LAND, FLAG_STOP):
+                        if flag in (FLAG_LAND, FLAG_STOP):
                             goto.cancel()
+                            orb.cancel()
                         self.pilot.pulse(flag)
                         if flag == FLAG_TAKEOFF:
                             flight_start = flight_start or now
@@ -549,6 +561,11 @@ class Link:
                         goto.set(req[1], req[2], now)
                         goto_stop = (req[3], req[4]) if len(req) > 4 and req[4] else None
                         toast("AI: flying to target")
+                    elif req[0] == "orbit" and img is not None and flight_start is not None:
+                        goto.cancel()
+                        orb.start(now, req[1], req[2], req[3])
+                        flightlog.event("orbit_start", target=req[1], direction=req[2], degrees=req[3])
+                        toast("AI: orbit – looking for you")
                 airborne = None if flight_start is None else now - flight_start
                 if ai.driving():
                     if any(held.values()):
@@ -558,7 +575,7 @@ class Link:
                 objs = obs.objects() if obs.enabled and img is not None else None
                 ahead = obs.ahead_info() if obs.enabled and img is not None and obs.depth else None
                 self.pilot.set_hold(self.sup.update(now, airborne, any(held.values()) or "shift" in pressed,
-                                                    goto.active, age, est.vel, est.valid, objs, ahead))
+                                                    goto.active or orb.active, age, est.vel, est.valid, objs, ahead))
                 self.depth_trust.update(now, ahead[0] if ahead else None, self.sup.hold_state == "holding")
                 if goto.active and goto_stop:              # AI fly_to with a stop distance (camera depth)
                     target_obj = next((o for o in objs or [] if o["id"] == goto_stop[0]), None)
@@ -613,8 +630,22 @@ class Link:
                     toast("go-to cancelled")
                 elif goto.active and age is not None and age > 1.5:
                     goto.cancel("lost")
+                if orb.active and (any(held.values()) or airborne is None):
+                    orb.cancel()
+                    toast("orbit cancelled")
+                elif orb.active and age is not None and age > 1.5:
+                    orb.cancel("lost")
                 ai_levels = ai.levels(now) if ai else None
-                if goto.active:
+                if orb.active:
+                    self.pilot.steer(orb.command(now, obs.objects() if obs.enabled and img is not None else None,
+                                                 est if age is not None and age < 0.5 else None))
+                    last_input = now
+                    if not orb.active:
+                        self.pilot.steer(dict.fromkeys(AXES, 0.0))
+                        flightlog.event("orbit_end", state=orb.state, turned=round(orb.turned))
+                        toast({"done": "orbit done", "lost": "lost you – stopped", "not found": "couldn't find anyone",
+                               "timeout": "orbit took too long – stopped"}.get(orb.state, "orbit stopped"))
+                elif goto.active:
                     self.pilot.steer(goto.command(now, age is not None and age < 0.5))
                     last_input = now                    # auto-trim waits, then recalibrates
                 elif ai_levels is not None:
@@ -640,11 +671,11 @@ class Link:
                              f"(x {est.vel['x']:+.3f} y {est.vel['y']:+.3f} z {est.vel['z']:+.3f}) -> "
                              f"trim x {t['x']:+.1f} y {t['y']:+.1f} z {t['z']:+.1f}")
             last_t = now
+            if flight_start is not None and not self.flying:    # each flight starts from your own trim
+                self.pilot.set_trims(manual_trim)
+                auto.start_flight(manual_trim)
             self.flying = flight_start is not None
             trims = self.pilot.trims()
-            if any(abs(trims[a] - saved_trim[a]) > 0.5 for a in trims):
-                drift.save_trim(TRIM_FILE, trims)
-                saved_trim = trims
             if age is None:
                 status = ("CONNECTING", hud.YELLOW)
             elif age > 1.0:
@@ -676,13 +707,15 @@ class Link:
                 "ahead": obs.ahead_info() if obs.enabled and img is not None else (None, False),
                 "depth_img": obs.depth_map.colour((img.shape[1], img.shape[0]))
                 if show_depth and obs.depth_map is not None and img is not None else None,
-                "toasts": ([tracker.status()] if tracker and tracker.active else []) + [m for m, _ in reversed(toasts)],
+                "toasts": ([tracker.status()] if tracker and tracker.active else [])
+                + ([orb.status()] if orb.active else []) + [m for m, _ in reversed(toasts)],
             }
             state["ai"] = None
             if ai:
                 state["levels"]["yaw"] = self.pilot.yaw_level()
                 depth_now = self.depth_trust.status(state.get("ahead") if obs.depth else None)
-                ai.publish({**ai_pilot.summarize(state, goto.state, auto.enabled), **self.sup.status(), **depth_now})
+                ai.publish({**ai_pilot.summarize(state, goto.state, auto.enabled), **self.sup.status(), **depth_now,
+                            "orbit": orb.state, "orbit_turned_deg": round(orb.turned)})
                 state["ai"] = self.sup.hud(now, self.agent)
                 state["ai"]["depth"] = depth_now["depth"]
                 hold = self.sup.hold
@@ -729,6 +762,9 @@ class Link:
             elif self.fly and k in TRIM_KEYS and (kb.user32 is None or "shift" in pressed):
                 axis, d = TRIM_KEYS[k]
                 self.pilot.adjust_trim(axis, d * TRIM_STEP)
+                lim = drift.TRIM_LIMIT[axis]
+                manual_trim[axis] = max(-lim, min(lim, manual_trim[axis] + d * TRIM_STEP))
+                drift.save_trim(TRIM_FILE, manual_trim)
                 t = self.pilot.trims()
                 toast(f"trim  X {t['x']:+.0f}  Y {t['y']:+.0f}  Z {t['z']:+.0f}")
             elif self.fly and k == ord("g"):
@@ -750,6 +786,8 @@ class Link:
                 toast("auto-trim " + ("on" if auto.enabled else "off"))
             elif self.fly and k == 8:
                 self.pilot.set_trims(dict.fromkeys(AXES, 0.0))
+                manual_trim = dict.fromkeys(AXES, 0.0)
+                drift.save_trim(TRIM_FILE, manual_trim)
                 toast("trim reset")
             elif k == ord("p"):
                 if self.latest_jpeg:
@@ -802,7 +840,6 @@ class Link:
         if writer:
             writer.release()
             self.log("recording saved")
-        drift.save_trim(TRIM_FILE, self.pilot.trims())
         cv2.destroyAllWindows()
 
 
@@ -816,8 +853,8 @@ def main():
                     help="which way the drone's camera points (for drift detection)")
     ap.add_argument("--no-autotrim", action="store_true", help="start with auto-trim off (K toggles)")
     ap.add_argument("--no-objects", action="store_true", help="start with object tracking off (O toggles)")
-    ap.add_argument("--depth", choices=["fast", "fine", "off"], default="fast",
-                    help="distance model: fast (default, ~50 ms on a GPU), fine (sharper, slow), off")
+    ap.add_argument("--depth", choices=["fast", "fine", "off"], default="off",
+                    help="distance model (off by default: it was unreliable): fast (~50 ms on a GPU), fine (sharper, slow), off")
     ap.add_argument("--cal-distance", type=float, default=1.0, metavar="M",
                     help="for depth calibration (key M): metres from the camera to the wall (default 1)")
     ap.add_argument("--model", choices=["tiny", "nano", "off"], default="tiny",
@@ -839,8 +876,11 @@ def main():
     ap.add_argument("--ai-model", help="override SPAR_MODEL for --ai")
     ap.add_argument("--ai-max-stick", type=float, default=60.0, help="AI stick cap in %% (default 60)")
     ap.add_argument("--no-ai-vision", action="store_true", help="don't send camera frames to the AI")
-    ap.add_argument("--no-ai-guard", action="store_true", help="turn off the obstacle guard (stops AI plans)")
-    ap.add_argument("--no-ai-hold", action="store_true", help="turn off position hold while the AI hovers")
+    ap.add_argument("--ai-guard", action="store_true",
+                    help="turn on obstacle avoidance (off by default: it was jumpy - stopping plans and backing away)")
+    ap.add_argument("--ai-hold", action="store_true",
+                    help="turn on video position hold while the AI hovers (off by default: on the real drone it "
+                         "overcorrected and made it sway)")
     ap.add_argument("--ai-hold-gain", type=float, default=supervisor.HOLD_GAIN,
                     help=f"hold: %% stick per frame-width/s of slide (default {supervisor.HOLD_GAIN:g})")
     ap.add_argument("--ai-hold-max", type=float, default=supervisor.HOLD_MAX,
@@ -916,7 +956,7 @@ def main():
         llm.log = link.log
         link.ai = ai_pilot.Bridge(args.ai_max_stick)
         link.pilot.source = link.ai.levels
-        link.sup = supervisor.Supervisor(link.ai, args.camera, not args.no_ai_guard, not args.no_ai_hold,
+        link.sup = supervisor.Supervisor(link.ai, args.camera, args.ai_guard, args.ai_hold,
                                          args.ai_hold_gain, args.ai_hold_max, args.ai_hold_min,
                                          args.ai_lost_land, args.ai_max_flight)
         link.sup.pilot = link.pilot
@@ -926,8 +966,8 @@ def main():
                                     auto_gyro=not args.no_ai_gyro)
         ai_pilot.start_console(link.agent, link.ai, lambda word: link.ai.request("action", word))
         link.log(f"AI pilot: {llm.model or '(no SPAR_MODEL set)'} at {llm.base}, sticks capped at "
-                 f"{args.ai_max_stick:g}%, guard {'off' if args.no_ai_guard else 'on'}, "
-                 f"hold {'off' if args.no_ai_hold else 'on'}, vision {'off' if args.no_ai_vision else 'on'}")
+                 f"{args.ai_max_stick:g}%, guard {'on' if args.ai_guard else 'off'}, "
+                 f"hold {'on' if args.ai_hold else 'off'}, vision {'off' if args.no_ai_vision else 'on'}")
     if variant == "a":
         threads.append(threading.Thread(target=link.video_a, daemon=True))
     if sys.platform == "win32" and variant != "webcam":

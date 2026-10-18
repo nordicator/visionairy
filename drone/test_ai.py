@@ -115,7 +115,7 @@ side = {"id": 8, "label": "chair", "box": (0.0, 0.3, 0.15, 0.7), "ttc": 0.8, "th
 
 def guard_case(levels, objects, age=0.05):
     b = Bridge()
-    sup = supervisor.Supervisor(b)
+    sup = supervisor.Supervisor(b, guard=True)
     out = []
     th = threading.Thread(target=lambda: out.append(b.run([{"levels": levels, "duration": 0.5, "ramp": 0.0}])),
                           daemon=True)
@@ -143,7 +143,7 @@ print("guard OK")
 
 # ---- supervisor: position hold ----------------------------------------------------
 b = Bridge()
-sup = supervisor.Supervisor(b)
+sup = supervisor.Supervisor(b, guard=True)
 t = 1000.0
 for i in range(40):                             # idle, sliding right at 0.05 frame-widths/s
     h = sup.update(t + i * 0.05, 10.0, False, False, 0.05, {"x": 0.05, "y": -0.2, "z": 0.0}, True, [])
@@ -157,7 +157,7 @@ h = sup.update(t + 3.2, 0.5, False, False, 0.05, {"x": 0.05, "y": 0.0, "z": 0.0}
 assert h == {"x": 0.0, "y": 0.0} and "leaving the ground" in sup.hold_state
 # turning: no hold during the turn and for HOLD_AFTER_TURN after it
 b = Bridge()
-sup = supervisor.Supervisor(b)
+sup = supervisor.Supervisor(b, guard=True)
 steps = [{"levels": {"x": 0, "y": 0, "z": 0, "yaw": 50}, "duration": 0.3, "ramp": 0},
          {"levels": {"x": 0, "y": 0, "z": 0, "yaw": 0}, "duration": 3.0, "ramp": 0}]
 threading.Thread(target=lambda: b.run(steps), daemon=True).start()
@@ -178,7 +178,7 @@ print("hold OK")
 
 # ---- hold softens itself when it wobbles ------------------------------------------
 b = Bridge()
-sup = supervisor.Supervisor(b)
+sup = supervisor.Supervisor(b, guard=True)
 t = 2000.0
 for i in range(200):                            # the slide flips direction every 0.3 s: a wobble
     v = 0.05 if (i // 6) % 2 == 0 else -0.05
@@ -190,14 +190,14 @@ print("wobble self-tuning OK: gain", round(sup.axes["x"].gain), "min", round(sup
 
 # ---- video watchdog + battery limit land the drone ----------------------------------
 b = Bridge()
-sup = supervisor.Supervisor(b, lost_land_s=5, flight_max_s=60)
+sup = supervisor.Supervisor(b, guard=True, lost_land_s=5, flight_max_s=60)
 sup.update(3000.0, 10.0, False, False, 0.05, Z, True, [])
 sup.update(3003.0, 13.0, False, False, 3.0, Z, False, [])
 assert sup.landing is None and "video" in sup.alerts
 sup.update(3006.0, 16.0, False, False, 6.0, Z, False, [])
 assert "no video" in sup.landing and ("action", "land") in b.take_requests()
 b = Bridge()
-sup = supervisor.Supervisor(b, flight_max_s=60)
+sup = supervisor.Supervisor(b, guard=True, flight_max_s=60)
 sup.update(4000.0, 61.0, False, False, 0.05, Z, True, [])
 assert "flight time" in sup.landing
 print("watchdogs OK")
@@ -250,7 +250,7 @@ print("depth status / trust / cross-check OK")
 
 def depth_guard_case(ahead):
     b = Bridge()
-    sup = supervisor.Supervisor(b)
+    sup = supervisor.Supervisor(b, guard=True)
     out = []
     th = threading.Thread(target=lambda: out.append(b.run([{"levels": fwd, "duration": 0.8, "ramp": 0.0}])),
                           daemon=True)
@@ -292,7 +292,7 @@ class _A:
 
 
 b = Bridge()
-sup = supervisor.Supervisor(b)
+sup = supervisor.Supervisor(b, guard=True)
 plan = [{"levels": {"x": 0, "y": 30, "z": 0, "yaw": 0}, "duration": 2, "ramp": 0.3},
         {"levels": {"x": 0, "y": 0, "z": 0, "yaw": 0}, "duration": 0.8, "ramp": 0}] * 4
 threading.Thread(target=lambda: b.run(plan), daemon=True).start()

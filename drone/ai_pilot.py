@@ -482,6 +482,14 @@ def tool_specs(max_stick, vision):
                               "reaches this (m, 0.4-3). Use >= 0.8 unless asked to get very close.", 0.4, 3),
             "x": _num("Picture point, 0 = left edge, 1 = right edge (instead of object_id).", 0, 1),
             "y": _num("Picture point, 0 = top edge, 1 = bottom edge (instead of object_id).", 0, 1)}),
+        fn("orbit", "Circle a person, camera on them the whole time (\"do a 360 around me\"). Finds them first "
+                    "(turns on the spot if nobody's in view), then strafes sideways while turning to keep them "
+                    "centred and keeping the same distance. Returns done / lost / not found / timeout.",
+           {"object_id": {"type": "integer", "description": "A human's id from get_status. Leave out: the biggest "
+                                                          "person in view, or search for one."},
+            "direction": {"type": "string", "enum": ["right", "left"],
+                          "description": "Which way to move round them (default right)."},
+            "degrees": _num("How far round, 30..720 (default 360).", 30, 720)}),
         fn("set_trim", "Set the permanent stick offsets that cancel drift, and/or turn auto-trim on or off. "
                        "Auto-trim normally does this by itself from the video.",
            {"right": _num("Roll trim %, -25..25.", -25, 25), "forward": _num("Pitch trim %, -25..25.", -25, 25),
@@ -528,6 +536,7 @@ Distances (depth) - treat with caution:
 - If depth disagrees with other cues (seconds_to_contact, how big the object looks, the camera frame), believe whichever says the thing is CLOSER.
 - When depth.trust is "low", or a tool result says DEPTH DISAGREES, go half as far per step and re-check, and tell the human the distances look unreliable.
 - To approach an object and stop short of it, use fly_to with object_id and stop_at_m: that checks the distance 20x a second.
+- "Do a 360 around me", "circle me", "orbit me": take off if needed, then call orbit (it finds the person itself). Don't fly a circle with stick steps.
 
 Automatic safety (runs 20x a second, faster than you can):
 - Obstacle guard: while a step flies forward, anything in the flight path that is very close or under 1.5 s away stops the plan at once, and so do the camera distance straight ahead staying under ~1 m and losing the video. The tool result then says "aborted: obstacle: ..." with stopped_during (which step), the objects and{" a camera frame" if vision else " the status"}. The drone is hovering where it stopped. Replan from there: go around (e.g. slide right 1 s, forward, slide back left) or stop and tell the human — never just repeat the same forward move.
@@ -771,13 +780,15 @@ class Agent:
                 return {"error": "no video frame" if self.vision else "vision is off (--ai-vision)"}
             self._attach(jpg, st, images)
             return {"result": "frame attached in the next message", "objects": st.get("objects", [])}
-        if name in ("move", "sequence", "hover", "fly_to", "takeoff") and self.bridge.overrides != self.overrides:
+        if name in ("move", "sequence", "hover", "fly_to", "orbit", "takeoff") and self.bridge.overrides != self.overrides:
             return {"error": f"movement stopped ({self.bridge.lock_reason}): no more movement until the "
                              "human types a new command"}
-        if name in ("move", "hover", "fly_to") and not flying:
+        if name in ("move", "hover", "fly_to", "orbit") and not flying:
             return {"error": "not flying: call takeoff first"}
         if name == "fly_to":
             return self._fly_to(a, st)
+        if name == "orbit":
+            return self._orbit(a)
         clamped = set()
         if name == "move":
             steps = [self._step(a, clamped)]
@@ -891,6 +902,15 @@ class Agent:
         s = self.bridge.snapshot()
         return {"result": done, "airborne": s.get("airborne")}
 
+    def _orbit(self, a):
+        oid = int(a["object_id"]) if a.get("object_id") is not None else None
+        self.bridge.request("orbit", oid, a.get("direction", "right"), float(a.get("degrees", 360)))
+        if not self.bridge.wait_until(lambda s: s.get("orbit") in ("finding", "orbiting"), 1.5):
+            return {"error": "couldn't start the orbit (no video?)"}
+        self.bridge.wait_until(lambda s: s.get("orbit") not in ("finding", "orbiting") or self.cancelled, 90)
+        s = self.bridge.snapshot()
+        return {"result": s.get("orbit"), "turned_deg": s.get("orbit_turned_deg")}
+
     def _fly_to(self, a, st):
         if a.get("object_id") is not None:
             obj = next((o for o in st.get("objects", []) if o["id"] == int(a["object_id"])), None)
@@ -970,11 +990,24 @@ def _short(s, n=160):
 def console(agent, bridge, direct, prompt="ai> "):
     """Read commands from the terminal. stop / land / kill bypass the LLM."""
     print('Type a command for the AI pilot ("stop", "land", "kill" act at once, no LLM).', flush=True)
+    try:
+        import voice
+        threading.Thread(target=voice.load, daemon=True).start()   # warm up while you get ready
+        print("Or press Enter on an empty line and say it.", flush=True)
+    except ImportError:
+        voice = None
     while True:
         try:
             text = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             return
+        if not text and voice:
+            try:
+                text = voice.listen(lambda m: print(m, flush=True))
+            except Exception as e:      # no mic permission, no model download yet, ...
+                print(f"  voice failed: {e}", flush=True)
+                continue
+            text = voice.direct_word(text, DIRECT) or text
         word = text.lower()
         if not text:
             continue

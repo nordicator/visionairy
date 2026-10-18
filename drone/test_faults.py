@@ -42,7 +42,9 @@ SCENARIOS = {
                     lambda d: d["end_distance"] > 2.5 or "the sim's baseline drift changed",
                     "the same draft with nothing correcting (baseline)"),
     "gale": (HOVER, ["--wind", "0.8"],
-             lambda d: d["collisions"] == 0 and (d["auto_land"] or d["end_distance"] < 3.0)
+             # 3.5 m, not 3.0: the hold lets go while landing (it made real landings crooked, see supervisor.py),
+             # so a gale carries it further on the way down
+             lambda d: d["collisions"] == 0 and (d["auto_land"] or d["end_distance"] < 3.5)
              and ev(d, "hold_escalate") or "didn't escalate or land",
              "strong 0.8 m/s air current: push limit raised until it holds (or it lands)"),
     "spike": (HOVER, ["--spike", "6,0.8,0,1"],

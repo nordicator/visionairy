@@ -2,8 +2,8 @@
 
 Height (Z) is never touched – throttle stays at hold-altitude – so only X and Y are driven:
 
-  forward camera:  spot right/left of centre -> fly right/left (+X) to centre it, and fly
-                   forward (+Y) until the spot looks APPROACH_ZOOM times bigger than when clicked
+  forward camera:  spot right/left of centre -> turn towards it, and fly forward (+Y) while it's
+                   roughly ahead, until the spot looks APPROACH_ZOOM times bigger than when clicked
   down camera:     spot right/left of centre -> fly right/left (+X),
                    spot above/below centre   -> fly forward/back (+Y), until it's under the crosshair
 
@@ -21,7 +21,10 @@ MIN_FEATURES = 4          # re-seed features below this
 MIN_STICK = 15.0          # % stick when off target at all (toy drones ignore tiny inputs)
 GAIN = 45.0               # extra % stick per unit of error (1 = edge of the picture)
 MAX_STICK = 50.0          # % stick, cap
-FORWARD_STICK = 25.0      # % stick forward while closing in (forward camera)
+FORWARD_STICK = 30.0      # % stick forward while closing in (forward camera)
+YAW_GAIN = 55.0           # forward camera: % yaw per unit of error (yaw has no momentum, so no minimum push)
+YAW_CAP = 45.0
+AIM_CONE = 0.4            # forward camera: flies forward while the spot is within this of centre
 APPROACH_ZOOM = 2.0       # forward camera: arrived once the spot looks this many times bigger
 ARRIVE_TOL = 0.06         # error (fraction of half the picture) counted as on target
 ARRIVE_HOLD = 0.6         # s on target before it counts as arrived
@@ -114,7 +117,7 @@ class ClickTarget:
 
     def command(self, t, fresh):
         """Stick levels (% per axis) towards the spot; Z is always 0 (hold altitude)."""
-        cmd = {"x": 0.0, "y": 0.0, "z": 0.0}
+        cmd = {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
         if not self.active or self.pos is None or not fresh:
             return cmd
         if t - self.started > TIMEOUT:
@@ -122,20 +125,23 @@ class ClickTarget:
             return cmd
         u, v = self.norm()
         ex, ey = 2 * u - 1, 2 * v - 1                    # -1..1, + = right / below centre
-        cmd["x"] = stick(ex)
         if self.camera == "forward":
+            # Turn to face it and fly at it. Strafing to centre it (the old way) overshot back and forth
+            # and hardly ever moved forward: a sideways move carries on after the stick lets go, a turn doesn't.
+            cmd["yaw"] = 0.0 if abs(ex) < ARRIVE_TOL else max(-YAW_CAP, min(YAW_CAP, YAW_GAIN * ex))
             close = self.zoom >= APPROACH_ZOOM
-            if not close:                                # centre it first, then close in
-                cmd["y"] = FORWARD_STICK * max(0.0, 1 - 2 * abs(ex))
+            if not close:
+                cmd["y"] = FORWARD_STICK * max(0.0, 1 - abs(ex) / AIM_CONE)
             there = close and abs(ex) < ARRIVE_TOL
         else:
+            cmd["x"] = stick(ex)
             cmd["y"] = stick(-ey)
             there = abs(ex) < ARRIVE_TOL and abs(ey) < ARRIVE_TOL
         if there:
             self.on_target_since = self.on_target_since or t
             if t - self.on_target_since >= ARRIVE_HOLD:
                 self.cancel("arrived")
-                return {"x": 0.0, "y": 0.0, "z": 0.0}
+                return {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
         else:
             self.on_target_since = None
         return cmd

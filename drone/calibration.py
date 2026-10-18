@@ -91,6 +91,10 @@ class Calibrated:
     def valid(self):
         return self.est.valid
 
+    @property
+    def spin(self):
+        return self.est.spin
+
     @valid.setter
     def valid(self, v):
         self.est.valid = v

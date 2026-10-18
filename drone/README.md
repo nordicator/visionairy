@@ -142,7 +142,8 @@ The LLM takes seconds to answer, so a faster layer runs every video frame undern
 | any movement key, T, L, SPACE, video lost | stops the AI's manoeuvre and its movement for that command |
 | `stop` / `land` / `kill` typed in the terminal | act at once, without the LLM |
 | a new command | cancels the current one |
-| `--no-ai-guard`, `--no-ai-hold` | turn the guard / position hold off |
+| `--ai-guard` | turn obstacle avoidance on (off by default) |
+| `--ai-hold` | turn video position hold on (off by default: it made the drone sway) |
 | `--ai-hold-min`, `--ai-hold-gain`, `--ai-hold-max` | hold tuning (it also tunes itself, see above) |
 
 `python test_faults.py` injects each of these problems into the simulator and checks the result (18 scenarios including 0.4-0.5 s of video lag, ~40 s).
