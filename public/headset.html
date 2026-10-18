@@ -30,28 +30,22 @@
 
       <div class="check"><input type="checkbox" id="stereo" checked /><label for="stereo">Split-screen for cardboard lenses</label></div>
 
-      <div class="check"><input type="checkbox" id="autoSync" checked /><label for="autoSync">Auto-sync to room cameras</label></div>
-      <div class="hint">Keeps lining the headset up with the room cameras by matching what they see. <b>Hold</b> anywhere to force a full sync.</div>
-
-      <label>Field of view <span class="val" id="fovVal">90°</span></label>
-      <input id="fov" type="range" min="50" max="120" value="90" />
-
       <label>Eye spacing <span class="val" id="ipdVal">0</span></label>
       <input id="ipd" type="range" min="-80" max="80" value="0" />
       <div class="hint">Nudge until both images line up into one through the lenses.</div>
 
       <label>Phone camera FOV <span class="val" id="passFovVal">65°</span></label>
       <input id="passFov" type="range" min="40" max="100" value="65" />
-      <div class="hint">How wide the headset phone's own camera is. Used to keep the X-ray hand fill lined up when you turn your head.</div>
+      <div class="hint">How wide the camera sees. Keeps the path lined up with the real room as you turn your head.</div>
 
       <button id="go">ENGAGE</button>
       <div id="err"></div>
 
       <p class="hint">
-        In the headset: <b>tap</b> the screen (or cardboard button) to switch mode ·
-        <b>hold</b> to sync with the room cameras (works facing any camera).<br />
-        On a laptop: drag to look, keys <b>1/2/3</b> for modes, <b>R</b> to sync.<br />
-        Modes: <b>XRAY</b> see through your hands · <b>DAS</b> room cameras only · <b>PASS</b> plain camera.
+        <b>Calibrate:</b> lay the beacon flat, lay the phone face up on top of it (top edge along the IMU's printed <b>Y arrow</b>) and leave both still. After a 2-second countdown it calibrates by itself. That spot becomes the origin (0, 0, 0): X right, Y along the arrow, Z up.<br />
+        From then on the beacon and the phone each track their own position. The beacon shows as a live dot with a trail, and <b>/graph</b> on the laptop shows both in 3D.<br />
+        Position comes from integrating motion sensors, so it drifts. To reset it, <b>touch the beacon to the phone and hold the screen</b>. <b>Tap</b> clears the trail.<br />
+        Laptop keys: <b>K</b> calibrate, <b>Z</b> re-zero, <b>C</b> clear.
       </p>
     </div>
   </div>

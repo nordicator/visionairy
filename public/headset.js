@@ -1,76 +1,72 @@
-// VisionAiry headset: head tracking + room camera fusion + see-through hands + F-35 style HUD.
+// VisionAiry headset: camera passthrough + F-35 style HUD + the ESP32 beacon's tracked position in AR.
 //
-// Coordinate convention: yaw is degrees clockwise from "straight ahead" (set by recenter),
-// pitch is degrees up from the horizon. Room cameras report the same heading/pitch for their lens.
-
-import { FilesetResolver, HandLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+// No vision tracking. The beacon streams its own dead-reckoned position (see esp32/beacon), and this phone
+// dead-reckons its own position the same way, from its motion sensors. Both start at the same point:
+// calibration happens with the phone lying on the beacon, so that spot is the origin for both.
+//
+// Frames:
+//   graph frame - the shared one. Origin = calibration spot, Z up, Y = the beacon's Y arrow at calibration
+//                 (= the phone's top edge), X = right. Beacon positions arrive in this frame.
+//   headset world - the phone's orientation sensor frame (X east-ish, Y north-ish, Z up). The camera view
+//                 is computed here. cal.yaw (heading of the graph's +Y in this frame) converts between them.
 
 const HUD = '#39ff6a';
 const HUD_DIM = 'rgba(57,255,106,0.45)';
-const MODES = ['XRAY', 'DAS', 'PASS'];
+const PATH = '#ffd23f';
 const DEG = Math.PI / 180;
 
 const $ = (id) => document.getElementById(id);
 const screenCanvas = $('screen');
 const screenCtx = screenCanvas.getContext('2d');
 
-// Offscreen layers: one eye is rendered once, then copied into both halves of the screen.
+// One eye is rendered once, then copied into both halves of the screen.
 const eye = document.createElement('canvas');
 const eyeCtx = eye.getContext('2d');
-const fx = document.createElement('canvas'); // see-through fill, cut to the hand shape
-const fxCtx = fx.getContext('2d');
-const mask = document.createElement('canvas'); // soft hand silhouette
-const maskCtx = mask.getContext('2d');
-const plate = document.createElement('canvas'); // last hand-free passthrough frame
-const plateCtx = plate.getContext('2d');
 
 const video = document.createElement('video');
 video.playsInline = true;
 video.muted = true;
 
-const settings = { stereo: true, fov: 90, ipd: 0, passFov: 65, autoSync: true };
+const TRAIL_SECONDS = 6;
+
+const settings = { stereo: true, ipd: 0, passFov: 65 };
 const state = {
-  mode: 0,
   yaw: 0, pitch: 0, roll: 0,
-  yawOffset: 0,
   gotSensor: false,
-  manualYaw: 0, manualPitch: 0,
-  cameras: new Map(), // slot -> { info, bitmap, decoding }
-  hands: [],
-  plateYaw: 0, platePitch: 0, plateValid: false,
   toast: '', toastUntil: 0,
   hintUntil: 0,
   fps: 0,
-  syncScore: 0, syncAt: 0,
+  beacon: null, // latest heartbeat relayed by the server
 };
-window.visionairy = { state, settings }; // poke at it from the dev console
+const cal = { yaw: null, pendingYaw: null }; // heading of the graph frame's +Y in the headset world
+const bcn = { p: null, q: null, still: false, air: false, at: 0, trail: [] }; // beacon, graph frame
+const phone = { p: [0, 0, 0], v: [0, 0, 0], quietFor: 0, trail: [] }; // this phone's camera, graph frame
+let lastThrow = null; // { v, p0, peak, airtime, impactG, spin, p1 }
+window.visionairy = { state, settings, cal, bcn, phone }; // poke at it from the dev console
 
 // ---------------------------------------------------------------------------
 // Setup screen
 
-for (const id of ['fov', 'ipd', 'passFov']) {
+const NUMERIC = ['ipd', 'passFov'];
+for (const id of NUMERIC) {
   const saved = localStorage.getItem('hs.' + id);
   if (saved !== null) $(id).value = saved;
 }
-for (const id of ['stereo', 'autoSync']) {
-  const saved = localStorage.getItem('hs.' + id);
-  if (saved !== null) $(id).checked = saved === '1';
+{
+  const saved = localStorage.getItem('hs.stereo');
+  if (saved !== null) $('stereo').checked = saved === '1';
 }
 
 function readSettings() {
   settings.stereo = $('stereo').checked;
-  settings.autoSync = $('autoSync').checked;
-  settings.fov = +$('fov').value;
   settings.ipd = +$('ipd').value;
   settings.passFov = +$('passFov').value;
-  $('fovVal').textContent = settings.fov + '°';
   $('ipdVal').textContent = settings.ipd;
   $('passFovVal').textContent = settings.passFov + '°';
-  for (const id of ['fov', 'ipd', 'passFov']) localStorage.setItem('hs.' + id, $(id).value);
+  for (const id of NUMERIC) localStorage.setItem('hs.' + id, $(id).value);
   localStorage.setItem('hs.stereo', settings.stereo ? '1' : '0');
-  localStorage.setItem('hs.autoSync', settings.autoSync ? '1' : '0');
 }
-document.querySelectorAll('#setup input').forEach((el) => el.addEventListener('input', readSettings));
+document.querySelectorAll('#setup input, #setup select').forEach((el) => el.addEventListener('input', readSettings));
 readSettings();
 
 $('go').onclick = async () => {
@@ -80,6 +76,9 @@ $('go').onclick = async () => {
     if (typeof DeviceOrientationEvent !== 'undefined' && DeviceOrientationEvent.requestPermission) {
       const res = await DeviceOrientationEvent.requestPermission();
       if (res !== 'granted') throw new Error('motion sensor permission denied');
+    }
+    if (typeof DeviceMotionEvent !== 'undefined' && DeviceMotionEvent.requestPermission) {
+      await DeviceMotionEvent.requestPermission().catch(() => {});
     }
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -96,135 +95,97 @@ $('go').onclick = async () => {
   document.documentElement.requestFullscreen?.().then(() => screen.orientation?.lock?.('landscape')).catch(() => {});
   navigator.wakeLock?.request('screen').catch(() => {});
 
-  state.hintUntil = performance.now() + 6000;
+  state.hintUntil = performance.now() + 8000;
   toast('SYSTEMS ONLINE');
   connect();
-  loadHandModel();
+  setInterval(sendPose, 50);
   requestAnimationFrame(frame);
 };
 
 // ---------------------------------------------------------------------------
-// Room camera feeds
+// Frames
 
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const len = (a) => Math.hypot(a[0], a[1], a[2]);
+
+// Graph frame -> headset world: turn clockwise by the calibrated heading
+function fromGraph(v) {
+  const c = (cal.yaw ?? 0) * DEG;
+  return [v[0] * Math.cos(c) + v[1] * Math.sin(c), -v[0] * Math.sin(c) + v[1] * Math.cos(c), v[2]];
+}
+function toGraph(v) {
+  const c = (cal.yaw ?? 0) * DEG;
+  return [v[0] * Math.cos(c) - v[1] * Math.sin(c), v[0] * Math.sin(c) + v[1] * Math.cos(c), v[2]];
+}
+
+// ---------------------------------------------------------------------------
+// Beacon link
+
+let ws = null;
 function connect() {
-  const ws = new WebSocket(`wss://${location.host}/ws?role=viewer`);
-  ws.binaryType = 'arraybuffer';
+  ws = new WebSocket(`wss://${location.host}/ws`);
   ws.onmessage = (e) => {
-    if (typeof e.data === 'string') {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'cameras') {
-        const live = new Set(msg.list.map((c) => c.slot));
-        for (const slot of state.cameras.keys()) if (!live.has(slot)) state.cameras.delete(slot);
-        for (const c of msg.list) {
-          const cam = state.cameras.get(c.slot) || { bitmap: null, raw: null, decoding: false, trim: { yaw: 0, pitch: 0 } };
-          cam.info = c;
-          state.cameras.set(c.slot, cam);
-        }
-      }
-      return;
-    }
-    const slot = new Uint8Array(e.data, 0, 1)[0];
-    const cam = state.cameras.get(slot);
-    if (!cam || cam.decoding) return; // still decoding the previous frame: drop this one
-    cam.decoding = true;
-    createImageBitmap(new Blob([new Uint8Array(e.data, 1)], { type: 'image/jpeg' }))
-      .then((bmp) => {
-        cam.bitmap = feather(bmp, cam.bitmap);
-        cam.raw?.close();
-        cam.raw = bmp; // unfeathered copy, used by visual sync
-      })
-      .catch(() => {})
-      .finally(() => (cam.decoding = false));
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'beacon') state.beacon = msg.online === false ? null : { ...msg, at: performance.now() };
+    else if (msg.type === 'bstate') onBeaconState(msg);
+    else if (msg.type === 'imu') onImuEvent(msg);
   };
   ws.onclose = () => setTimeout(connect, 1000);
 }
 
-// Fade each frame's edges to transparent so overlapping cameras blend instead of cutting hard.
-const featherMasks = new Map(); // "w x h" -> mask canvas
-
-function featherMask(w, h) {
-  const key = w + 'x' + h;
-  if (featherMasks.has(key)) return featherMasks.get(key);
-  const m = document.createElement('canvas');
-  m.width = w;
-  m.height = h;
-  const c = m.getContext('2d');
-  const img = c.createImageData(w, h);
-  const edge = w * 0.12;
-  const ramp = (d) => Math.min(1, d / edge);
-  for (let y = 0; y < h; y++) {
-    const ay = ramp(Math.min(y, h - 1 - y));
-    for (let x = 0; x < w; x++) img.data[(y * w + x) * 4 + 3] = 255 * ay * ramp(Math.min(x, w - 1 - x));
-  }
-  c.putImageData(img, 0, 0);
-  featherMasks.set(key, m);
-  return m;
+function beaconCmd(cmd) {
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ type: 'cmd', cmd }));
 }
 
-function feather(bmp, reuse) {
-  const out = reuse || document.createElement('canvas');
-  if (out.width !== bmp.width || out.height !== bmp.height) {
-    out.width = bmp.width;
-    out.height = bmp.height;
-  }
-  const c = out.getContext('2d');
-  c.globalCompositeOperation = 'copy';
-  c.drawImage(bmp, 0, 0);
-  c.globalCompositeOperation = 'destination-in';
-  c.drawImage(featherMask(bmp.width, bmp.height), 0, 0);
-  return out;
+const beaconLive = () => !!(state.beacon && performance.now() - state.beacon.at < 3000);
+
+function onBeaconState(msg) {
+  const now = performance.now();
+  Object.assign(bcn, { p: msg.p, q: msg.q, still: msg.still, air: msg.air, at: now });
+  if (!msg.cal) return;
+  bcn.trail.push({ t: now, p: msg.p, air: msg.air });
+  while (bcn.trail.length && now - bcn.trail[0].t > TRAIL_SECONDS * 1000) bcn.trail.shift();
+  if (msg.air && lastThrow && !lastThrow.airtime) lastThrow.peak = Math.max(lastThrow.peak, msg.p[2]);
 }
 
-// ---------------------------------------------------------------------------
-// Hand tracking
-
-let handLandmarker = null;
-let lastHandRun = 0;
-
-async function loadHandModel() {
-  try {
-    const files = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
-    const opts = (delegate) => ({
-      baseOptions: {
-        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-        delegate,
-      },
-      runningMode: 'VIDEO',
-      numHands: 2,
-    });
-    try {
-      handLandmarker = await HandLandmarker.createFromOptions(files, opts('GPU'));
-    } catch {
-      handLandmarker = await HandLandmarker.createFromOptions(files, opts('CPU'));
+function onImuEvent(msg) {
+  if (msg.event === 'cal') {
+    if (msg.result === 'ok' && cal.pendingYaw !== null) {
+      cal.yaw = cal.pendingYaw;
+      zeroPhone();
+      bcn.trail = [];
+      toast('CALIBRATED // ORIGIN SET');
+    } else if (msg.result === 'moving') {
+      toast('MOVED // HOLD STILL, TRY AGAIN');
+    } else if (msg.result === 'noimu') {
+      toast('BEACON HAS NO IMU');
     }
-    toast('HAND TRACKING ONLINE');
-  } catch (err) {
-    console.error(err);
-    toast('HAND TRACKING OFFLINE');
+    cal.pendingYaw = null;
+  } else if (msg.event === 'zero') {
+    bcn.trail = [];
+  } else if (msg.event === 'launch') {
+    // The server sends the release position as `d` (VAE1 launch ... vx vy vz px py pz)
+    lastThrow = { v: msg.v, p0: msg.d, peak: msg.d[2] };
+    toast('LAUNCH');
+  } else if (msg.event === 'land') {
+    if (!lastThrow || lastThrow.airtime) return;
+    Object.assign(lastThrow, { airtime: msg.airtime / 1000, impactG: msg.impactG, spin: msg.spin, p1: bcn.p });
+    toast('IMPACT');
   }
 }
 
-function updateHands(now) {
-  if (!handLandmarker || MODES[state.mode] !== 'XRAY' || now - lastHandRun < 40 || !video.videoWidth) return;
-  lastHandRun = now;
-  try {
-    state.hands = handLandmarker.detectForVideo(video, now).landmarks || [];
-  } catch (err) {
-    console.error(err);
-    state.hands = [];
-  }
+// The phone's pose for the 3D graph: camera position + its device axes, all in the graph frame
+function sendPose() {
+  if (ws?.readyState !== 1 || !rot || cal.yaw === null) return;
+  const col = (j) => toGraph([rot[j], rot[3 + j], rot[6 + j]]);
+  ws.send(JSON.stringify({ type: 'phone', p: phone.p, x: col(0), y: col(1), z: col(2) }));
 }
-
-const BONES = [
-  [0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [5, 9], [9, 10], [10, 11], [11, 12],
-  [9, 13], [13, 14], [14, 15], [15, 16], [13, 17], [17, 18], [18, 19], [19, 20], [0, 17],
-];
-const PALM = [0, 1, 5, 9, 13, 17];
 
 // ---------------------------------------------------------------------------
-// Head tracking
+// Head tracking (orientation) and the phone's own position (dead reckoning)
 
-let rot = null; // device -> world rotation matrix from the latest sensor event
+let rot = null; // device -> world rotation matrix: column j is device axis j in world coordinates
 let fwd = null; // smoothed look direction (world)
 let upDev = null; // smoothed world-up expressed in device coordinates
 
@@ -241,6 +202,36 @@ window.addEventListener('deviceorientation', (e) => {
   ];
 });
 
+// Same tricks as the beacon: zero-velocity updates whenever the phone is still, and a speed cap
+const PHONE_QUIET_S = 0.25;
+window.addEventListener('devicemotion', (e) => {
+  const a = e.acceleration; // gravity already removed by the OS, device axes, m/s²
+  if (!a || a.x === null || !rot || cal.yaw === null) return;
+  let dt = e.interval || 1 / 60;
+  if (dt > 1) dt /= 1000; // the spec says ms, older Safari reports seconds
+  dt = Math.min(dt, 0.1);
+  const world = [
+    rot[0] * a.x + rot[1] * a.y + rot[2] * a.z,
+    rot[3] * a.x + rot[4] * a.y + rot[5] * a.z,
+    rot[6] * a.x + rot[7] * a.y + rot[8] * a.z,
+  ];
+  const acc = toGraph(world);
+  const r = e.rotationRate;
+  const spin = r ? Math.hypot(r.alpha || 0, r.beta || 0, r.gamma || 0) : 0;
+  phone.quietFor = len(acc) < 0.3 && spin < 20 ? phone.quietFor + dt : 0;
+  for (let i = 0; i < 3; i++) phone.v[i] += acc[i] * dt;
+  if (phone.quietFor > PHONE_QUIET_S) phone.v = [0, 0, 0];
+  const speed = len(phone.v);
+  if (speed > 5) phone.v = phone.v.map((x) => (x * 5) / speed);
+  for (let i = 0; i < 3; i++) phone.p[i] += phone.v[i] * dt;
+});
+
+function zeroPhone() {
+  phone.p = [0, 0, 0];
+  phone.v = [0, 0, 0];
+  phone.trail = [];
+}
+
 const lerpVec = (a, b, t) => {
   if (!a) return b;
   const v = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
@@ -251,82 +242,111 @@ const lerpVec = (a, b, t) => {
 const wrap180 = (d) => ((((d + 180) % 360) + 360) % 360) - 180;
 const wrap360 = (d) => ((d % 360) + 360) % 360;
 
-let rawYaw = 0;
-
-function updatePose() {
+function updatePose(now) {
   if (state.gotSensor && rot) {
     // Rear camera looks out the back of the phone: device -Z
     fwd = lerpVec(fwd, [-rot[2], -rot[5], -rot[8]], 0.5);
     upDev = lerpVec(upDev, [rot[6], rot[7], rot[8]], 0.5);
-    rawYaw = Math.atan2(fwd[0], fwd[1]) / DEG;
+    state.yaw = Math.atan2(fwd[0], fwd[1]) / DEG;
     state.pitch = Math.asin(Math.max(-1, Math.min(1, fwd[2]))) / DEG;
 
     // Roll: where world-up points on the (possibly rotated) screen
-    const sa = (screen.orientation?.angle ?? window.orientation ?? 0) * DEG;
+    const sa = (screen.orientation?.angle ?? 0) * DEG;
     const sx = upDev[0] * Math.cos(sa) - upDev[1] * Math.sin(sa);
     const sy = upDev[0] * Math.sin(sa) + upDev[1] * Math.cos(sa);
     state.roll = Math.atan2(sx, sy) / DEG;
-  } else {
-    rawYaw = state.manualYaw;
-    state.pitch = state.manualPitch;
-    state.roll = 0;
   }
-  state.yaw = wrap180(rawYaw - state.yawOffset);
-}
-
-function recenter() {
-  state.plateValid = false;
-  const hit = syncGlobal();
-  if (hit) {
-    toast('SYNCED TO ' + hit.name);
-  } else {
-    // No camera matched what we see: fall back to "I'm facing heading 0"
-    state.yawOffset = rawYaw;
-    toast('RECENTERED (NO MATCH)');
-  }
+  const last = phone.trail[phone.trail.length - 1];
+  if (!last || now - last.t > 50) phone.trail.push({ t: now, p: [...phone.p] });
+  while (phone.trail.length && now - phone.trail[0].t > TRAIL_SECONDS * 1000) phone.trail.shift();
 }
 
 // ---------------------------------------------------------------------------
-// Input: tap = next mode, hold = sync/recenter, drag = look (laptop)
+// Calibration: phone lying face up on the beacon, top edge along the IMU's Y arrow
+
+function calibrate() {
+  if (!beaconLive()) return toast('NO BEACON LINK');
+  if (state.gotSensor && rot) {
+    if (Math.abs(rot[8]) < 0.9) return toast('LAY THE PHONE FLAT ON THE BEACON');
+    cal.pendingYaw = Math.atan2(rot[1], rot[4]) / DEG; // heading of the phone's top edge (device +Y)
+  } else {
+    // Laptop: the webcam looks at you, so a beacon whose Y arrow points at the screen faces heading 180
+    cal.pendingYaw = 180;
+  }
+  beaconCmd('cal');
+  toast('CALIBRATING // HOLD STILL');
+}
+
+// Hands-free: lying face up and still for AUTO_CAL_MS (with the beacon still too) calibrates by itself,
+// once per placement. Picking the phone up re-arms it.
+const AUTO_CAL_MS = 2000;
+const flat = { since: 0, heading: 0, done: false };
+
+function autoCalibrate(now) {
+  if (!state.gotSensor || !rot) return;
+  if (rot[8] < 0.95) { // not lying face up
+    flat.since = 0;
+    flat.done = false;
+    return;
+  }
+  const heading = Math.atan2(rot[1], rot[4]) / DEG;
+  const bc = state.beacon;
+  // Before calibration the beacon's spin still includes its gyro bias (~5 °/s), hence the loose limit
+  const beaconStill = beaconLive() && bc.imu && bc.spin < 12 && !bc.airborne;
+  if (!flat.since || Math.abs(wrap180(heading - flat.heading)) > 2 || !beaconStill) {
+    flat.since = now;
+    flat.heading = heading;
+    return;
+  }
+  if (!flat.done && now - flat.since > AUTO_CAL_MS) {
+    flat.done = true;
+    calibrate();
+  }
+}
+
+// Beacon touching the phone: put both back at the same point, which wipes out the drift
+function rezero() {
+  if (cal.yaw === null) return toast('CALIBRATE FIRST');
+  beaconCmd('zero');
+  zeroPhone();
+  bcn.trail = [];
+  toast('RE-ZEROED');
+}
+
+// ---------------------------------------------------------------------------
+// Input: tap = clear trail, hold = re-zero
 
 let down = null;
 window.addEventListener('pointerdown', (e) => {
   if ($('setup').style.display !== 'none') return;
-  down = { x: e.clientX, y: e.clientY, t: performance.now(), moved: false };
+  down = { x: e.clientX, y: e.clientY, t: performance.now() };
 });
-window.addEventListener('pointermove', (e) => {
+window.addEventListener('pointerup', (e) => {
   if (!down) return;
-  const dx = e.clientX - down.x, dy = e.clientY - down.y;
-  if (Math.hypot(dx, dy) > 10) down.moved = true;
-  if (!state.gotSensor && down.moved) {
-    state.manualYaw = wrap180(state.manualYaw - e.movementX * 0.25);
-    state.manualPitch = Math.max(-89, Math.min(89, state.manualPitch + e.movementY * 0.25));
-  }
-});
-window.addEventListener('pointerup', () => {
-  if (!down) return;
-  const held = performance.now() - down.t;
-  if (!down.moved) held > 600 ? recenter() : setMode(state.mode + 1);
+  const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y) > 10;
+  if (!moved) performance.now() - down.t > 600 ? rezero() : clearTrail();
   down = null;
 });
 window.addEventListener('keydown', (e) => {
-  if (e.key >= '1' && e.key <= '3') setMode(+e.key - 1);
-  if (e.key === 'r' || e.key === 'R') recenter();
+  const k = e.key.toLowerCase();
+  if (k === 'c') clearTrail();
+  if (k === 'k') calibrate();
+  if (k === 'z') rezero();
 });
-
-function setMode(m) {
-  state.mode = (m + MODES.length) % MODES.length;
-  state.hands = [];
-  toast('MODE ' + MODES[state.mode]);
-}
 
 function toast(text) {
   state.toast = text;
-  state.toastUntil = performance.now() + 1500;
+  state.toastUntil = performance.now() + 1800;
+}
+
+function clearTrail() {
+  bcn.trail = [];
+  lastThrow = null;
+  toast('TRAIL CLEARED');
 }
 
 // ---------------------------------------------------------------------------
-// Rendering
+// Camera geometry
 
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -337,38 +357,31 @@ function resize() {
     screenCanvas.height = H;
   }
   const ew = settings.stereo ? Math.round(W / 2) : W;
-  for (const c of [eye, fx, mask]) {
-    if (c.width !== ew || c.height !== H) {
-      c.width = ew;
-      c.height = H;
-    }
+  if (eye.width !== ew || eye.height !== H) {
+    eye.width = ew;
+    eye.height = H;
   }
   return dpr;
 }
 
-// Map the headset video onto the eye with "cover" scaling; returns the transform.
+// Map the video onto the eye with "cover" scaling; returns the transform.
 function videoTransform(w, h) {
   const vw = video.videoWidth, vh = video.videoHeight;
   const s = Math.max(w / vw, h / vh);
   return { s, ox: (w - vw * s) / 2, oy: (h - vh * s) / 2, vw, vh };
 }
 
-// Pixels-per-unit-tangent for the current view. In DAS it's the virtual lens (settings.fov). With passthrough
-// on screen it must match the phone camera as displayed, or room-camera fills and the HUD won't line up.
-function focalPx(w) {
-  if (MODES[state.mode] !== 'DAS' && video.videoWidth) {
-    const t = videoTransform(w, eye.height);
-    return (t.vw * t.s) / 2 / Math.tan((settings.passFov / 2) * DEG);
-  }
-  return w / 2 / Math.tan((settings.fov / 2) * DEG);
+// Pixels-per-unit-tangent of the passthrough as displayed, so drawings line up with the real room.
+function focalPx(w, h) {
+  if (!video.videoWidth) return w / 2 / Math.tan((settings.passFov / 2) * DEG);
+  const t = videoTransform(w, h);
+  return (t.vw * t.s) / 2 / Math.tan((settings.passFov / 2) * DEG);
 }
 
 function dirVec(yawDeg, pitchDeg) {
   const y = yawDeg * DEG, p = pitchDeg * DEG;
   return [Math.sin(y) * Math.cos(p), Math.cos(y) * Math.cos(p), Math.sin(p)];
 }
-
-const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
 // Forward / right / up unit vectors for a view at the given heading and pitch
 function basis(headingDeg, pitchDeg) {
@@ -380,356 +393,165 @@ function basis(headingDeg, pitchDeg) {
   };
 }
 
-// Where a room camera actually points: its configured aim plus what visual sync has learned
-function camAim(cam) {
-  return [cam.info.heading + cam.trim.yaw, cam.info.pitch + cam.trim.pitch];
+// The camera for this frame. A graph-frame point -> un-rolled screen offset from center
+// (draw inside a roll-rotated context).
+let cam = null;
+function setupCamera(w, h) {
+  cam = { f: focalPx(w, h), view: basis(state.yaw, state.pitch), eye: phone.p };
+}
+function project(g) {
+  const p = fromGraph(sub(g, cam.eye));
+  const z = dot(p, cam.view.F);
+  return { x: (cam.f * dot(p, cam.view.R)) / z, y: (-cam.f * dot(p, cam.view.U)) / z, z };
 }
 
 // ---------------------------------------------------------------------------
-// Visual sync. The gyro only knows relative yaw (and drifts), and camera headings are only as good as
-// where someone put the camera. So compare edges in the passthrough with each room camera's frame and
-// solve for the angle where they overlap best.
+// Rendering
 
-const SYNC_W = 96; // analysis width of the passthrough, px
-const SYNC_MIN = 0.3; // minimum edge correlation to trust a match
-const syncCanvas = document.createElement('canvas');
-const syncCtx = syncCanvas.getContext('2d', { willReadFrequently: true });
+const NEAR = 0.1; // m: don't draw anything closer than this in front of the camera
 
-// Draw something into a small canvas and return its edge strength (Sobel magnitude) per pixel.
-function edges(w, h, draw) {
-  syncCanvas.width = w;
-  syncCanvas.height = h;
-  syncCtx.fillStyle = '#000';
-  syncCtx.fillRect(0, 0, w, h);
-  draw(syncCtx);
-  const px = syncCtx.getImageData(0, 0, w, h).data;
-  const g = new Float32Array(w * h);
-  for (let i = 0; i < w * h; i++) g[i] = px[i * 4] * 0.3 + px[i * 4 + 1] * 0.59 + px[i * 4 + 2] * 0.11;
-  const e = new Float32Array(w * h);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
-      const gx = g[i - w + 1] + 2 * g[i + 1] + g[i + w + 1] - g[i - w - 1] - 2 * g[i - 1] - g[i + w - 1];
-      const gy = g[i + w - 1] + 2 * g[i + w] + g[i + w + 1] - g[i - w - 1] - 2 * g[i - w] - g[i - w + 1];
-      e[i] = Math.sqrt(gx * gx + gy * gy);
+function stroke3(ctx, pts) {
+  ctx.beginPath();
+  let pen = false;
+  for (const p of pts) {
+    const q = project(p);
+    if (q.z < NEAR) { pen = false; continue; }
+    pen ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y);
+    pen = true;
+  }
+  ctx.stroke();
+}
+
+// A line in 3D drawn as a tube: each segment is as wide as `radius` metres would look at its distance,
+// so near parts are fat and far parts thin, which is what makes it read as an object in the room.
+function tube3(ctx, pts, radius, minPx = 1.5) {
+  let prev = null;
+  for (const p of pts) {
+    const q = project(p);
+    if (q.z < NEAR) { prev = null; continue; }
+    if (prev) {
+      ctx.lineWidth = Math.max(minPx, Math.min(60, (cam.f * radius * 2) / ((q.z + prev.z) / 2)));
+      ctx.beginPath();
+      ctx.moveTo(prev.x, prev.y);
+      ctx.lineTo(q.x, q.y);
+      ctx.stroke();
     }
+    prev = q;
   }
-  return { w, h, e };
 }
 
-// Passthrough, de-rolled so it lines up with level room cameras. Uses the inner 80% to avoid rotation corners.
-function passEdges() {
-  const w = SYNC_W, h = Math.round((SYNC_W * video.videoHeight) / video.videoWidth);
-  const img = edges(w, h, (c) => {
-    c.translate(w / 2, h / 2);
-    c.rotate(-state.roll * DEG);
-    c.drawImage(video, -w / 2, -h / 2, w, h);
-    c.setTransform(1, 0, 0, 1, 0, 0);
-  });
-  img.f = w / 2 / Math.tan((settings.passFov / 2) * DEG); // px per unit tangent
-  img.x0 = Math.round(w * 0.1); img.x1 = w - img.x0;
-  img.y0 = Math.round(h * 0.1); img.y1 = h - img.y0;
-  return img;
+function label3(ctx, p, text, dy = 0) {
+  const q = project(p);
+  if (q.z < NEAR) return;
+  ctx.fillText(text, q.x, q.y + dy);
 }
 
-// Room camera frame resampled to the same px-per-tangent as the passthrough
-function camEdges(cam, f) {
-  const w = Math.round(2 * f * Math.tan((cam.info.fov / 2) * DEG));
-  const h = Math.round((w * cam.raw.height) / cam.raw.width);
-  return edges(w, h, (c) => c.drawImage(cam.raw, 0, 0, w, h));
-}
+const fmt = (v) => (v >= 0 ? '+' : '') + v.toFixed(2);
+const coord = (p) => `X${fmt(p[0])} Y${fmt(p[1])} Z${fmt(p[2])}`;
 
-// Normalized cross-correlation of A (template) against B over a range of offsets.
-// Offset (ox, oy) means A pixel (x, y) sits on B pixel (x + ox, y + oy).
-function bestOffset(A, B, oxMin, oxMax, oyMin, oyMax) {
-  const area = (A.x1 - A.x0) * (A.y1 - A.y0);
-  let best = { score: -1 };
-  for (let oy = oyMin; oy <= oyMax; oy++) {
-    for (let ox = oxMin; ox <= oxMax; ox++) {
-      const xa = Math.max(A.x0, -ox), xb = Math.min(A.x1, B.w - ox);
-      const ya = Math.max(A.y0, -oy), yb = Math.min(A.y1, B.h - oy);
-      const n = (xb - xa) * (yb - ya);
-      if (xb <= xa || yb <= ya || n < area * 0.35) continue;
-      let sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
-      for (let y = ya; y < yb; y++) {
-        let ia = y * A.w + xa, ib = (y + oy) * B.w + xa + ox;
-        for (let x = xa; x < xb; x++, ia++, ib++) {
-          const a = A.e[ia], b = B.e[ib];
-          sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b;
-        }
-      }
-      const den = Math.sqrt((n * saa - sa * sa) * (n * sbb - sb * sb));
-      if (!den) continue;
-      // Favour bigger overlaps so a tiny sliver can't win by luck
-      const score = ((n * sab - sa * sb) / den) * Math.min(1, n / (area * 0.6));
-      if (score > best.score) best = { score, ox, oy };
-    }
-  }
-  return best;
-}
-
-// Turn a match into the true direction of the headset's view center.
-function matchedDirection(A, B, cam, m) {
-  const sx = A.w / 2 + m.ox - B.w / 2, sy = A.h / 2 + m.oy - B.h / 2;
-  const { F, R, U } = basis(...camAim(cam));
-  const d = [0, 1, 2].map((k) => F[k] * A.f + sx * R[k] - sy * U[k]);
-  const n = Math.hypot(...d);
-  return { yaw: Math.atan2(d[0], d[1]) / DEG, pitch: Math.asin(d[2] / n) / DEG };
-}
-
-// Expected offset of A's center inside B, given the current pose estimate
-function predictedOffset(A, B, cam) {
-  const { F, R, U } = basis(...camAim(cam));
-  const V = dirVec(state.yaw, state.pitch);
-  const z = dot(V, F);
-  return { ox: Math.round(B.w / 2 + (A.f * dot(V, R)) / z - A.w / 2), oy: Math.round(B.h / 2 - (A.f * dot(V, U)) / z - A.h / 2) };
-}
-
-const syncable = (cam) => cam.raw && cam.info && Math.abs(cam.info.pitch) <= 60; // floor cams have no useful heading
-
-// Hold gesture: search every camera across its whole width, then set the headset's yaw from the best match.
-function syncGlobal() {
-  if (!video.videoWidth || Math.abs(state.pitch) > 60) return null;
-  const A = passEdges();
-  const ppd = A.f * DEG;
-  let best = null;
-  for (const cam of state.cameras.values()) {
-    if (!syncable(cam)) continue;
-    const B = camEdges(cam, A.f);
-    // Pitch is trustworthy (gravity), so only a narrow vertical band needs searching
-    const oy = Math.round(B.h / 2 - A.f * Math.tan((state.pitch - camAim(cam)[1]) * DEG) - A.h / 2);
-    const m = bestOffset(A, B, -A.w, B.w, oy - Math.round(10 * ppd), oy + Math.round(10 * ppd));
-    if (m.score > (best?.m.score ?? SYNC_MIN)) best = { cam, A, B, m };
-  }
-  if (!best) return null;
-  const dir = matchedDirection(best.A, best.B, best.cam, best.m);
-  state.yawOffset = rawYaw - dir.yaw;
-  best.cam.trim.pitch += state.pitch - dir.pitch;
-  state.syncScore = best.m.score;
-  state.syncAt = performance.now();
-  return best.cam.info;
-}
-
-// Continuous: every so often, refine the trim of the camera we're looking at with a small local search.
-// This soaks up gyro drift and per-camera placement error.
-let lastAutoSync = 0;
-
-function autoSync(now) {
-  if (!settings.autoSync || now - lastAutoSync < 400 || !video.videoWidth || state.hands.length) return;
-  if (Math.abs(state.pitch) > 60) return;
-  lastAutoSync = now;
-  const V = dirVec(state.yaw, state.pitch);
-  let cam = null, bestZ = 0.85; // only cameras within ~30° of where we're looking
-  for (const c of state.cameras.values()) {
-    if (!syncable(c)) continue;
-    const z = dot(V, dirVec(...camAim(c)));
-    if (z > bestZ) { bestZ = z; cam = c; }
-  }
-  if (!cam) return;
-  const A = passEdges();
-  const B = camEdges(cam, A.f);
-  const p = predictedOffset(A, B, cam);
-  const r = Math.round(12 * A.f * DEG); // covers a camera placed up to ~12° off its preset
-  const m = bestOffset(A, B, p.ox - r, p.ox + r, p.oy - r, p.oy + r);
-  if (m.score < SYNC_MIN) return;
-  const dir = matchedDirection(A, B, cam, m);
-  // Ease toward the measured error rather than jumping, so one bad match can't yank the view
-  const clamp = (v) => Math.max(-30, Math.min(30, v));
-  cam.trim.yaw = clamp(cam.trim.yaw + 0.5 * wrap180(state.yaw - dir.yaw));
-  cam.trim.pitch = clamp(cam.trim.pitch + 0.5 * (state.pitch - dir.pitch));
-  state.syncScore = m.score;
-  state.syncAt = now;
-}
-
-// Mesh resolution for projecting each room-camera frame. Each cell is drawn as two affine triangles,
-// which tracks the true perspective closely without WebGL.
-const MESH_X = 6, MESH_Y = 4;
-
-// Project every room camera into the current view. Returns how many were visible.
-function drawDAS(ctx, w, h) {
-  const f = focalPx(w);
-  const y = state.yaw * DEG, p = state.pitch * DEG;
-  const F = dirVec(state.yaw, state.pitch);
-  const R = [Math.cos(y), -Math.sin(y), 0];
-  const U = [-Math.sin(y) * Math.sin(p), -Math.cos(y) * Math.sin(p), Math.cos(p)];
-
-  const visible = [];
-  for (const cam of state.cameras.values()) {
-    if (!cam.bitmap || !cam.info) continue;
-    const z = dot(dirVec(...camAim(cam)), F);
-    if (z < 0.2) continue;
-    visible.push({ cam, z });
-  }
-  // Furthest from center first, so the best-aligned camera ends up on top
-  visible.sort((a, b) => a.z - b.z);
-
+// Everything that lives in the room, drawn in a roll-rotated context
+function drawWorld(ctx, w, h, now) {
+  const fs = Math.round(h / 34);
   ctx.save();
   ctx.translate(w / 2, h / 2);
   ctx.rotate(state.roll * DEG);
-  for (const v of visible) {
-    const { info, bitmap: bmp } = v.cam;
-    const { F: cF, R: cR, U: cU } = basis(...camAim(v.cam));
-    const tx = Math.tan((info.fov / 2) * DEG), ty = (tx * bmp.height) / bmp.width;
+  ctx.lineCap = ctx.lineJoin = 'round';
+  ctx.font = `${fs}px Menlo, monospace`;
+  ctx.textAlign = 'center';
 
-    // Project mesh vertices: image (px) -> world ray -> screen
-    const pts = [];
-    for (let j = 0; j <= MESH_Y; j++) {
-      for (let i = 0; i <= MESH_X; i++) {
-        const u = (i / MESH_X) * 2 - 1, vv = 1 - (j / MESH_Y) * 2;
-        const d = [0, 1, 2].map((k) => cF[k] + u * tx * cR[k] + vv * ty * cU[k]);
-        const z = dot(d, F);
-        pts.push({ ix: (i / MESH_X) * bmp.width, iy: (j / MESH_Y) * bmp.height, z,
-          x: (f * dot(d, R)) / z, y: (-f * dot(d, U)) / z });
-      }
-    }
-    ctx.globalAlpha = Math.min(1, (v.z - 0.2) * 3);
-    const at = (i, j) => pts[j * (MESH_X + 1) + i];
-    for (let j = 0; j < MESH_Y; j++) {
-      for (let i = 0; i < MESH_X; i++) {
-        const a = at(i, j), b = at(i + 1, j), c = at(i, j + 1), d = at(i + 1, j + 1);
-        if (a.z < 0.05 || b.z < 0.05 || c.z < 0.05 || d.z < 0.05) continue;
-        drawTriangle(ctx, bmp, a, b, c);
-        drawTriangle(ctx, bmp, b, d, c);
-      }
-    }
-  }
-  ctx.restore();
-  return visible;
-}
-
-// Draw one triangle of an image with the affine map that sends its image corners to its screen corners.
-function drawTriangle(ctx, img, p0, p1, p2) {
-  const du1 = p1.ix - p0.ix, dv1 = p1.iy - p0.iy, du2 = p2.ix - p0.ix, dv2 = p2.iy - p0.iy;
-  const det = du1 * dv2 - du2 * dv1;
-  if (!det) return;
-  const dx1 = p1.x - p0.x, dy1 = p1.y - p0.y, dx2 = p2.x - p0.x, dy2 = p2.y - p0.y;
-  const a = (dx1 * dv2 - dx2 * dv1) / det, c = (du1 * dx2 - du2 * dx1) / det;
-  const b = (dy1 * dv2 - dy2 * dv1) / det, d = (du1 * dy2 - du2 * dy1) / det;
-  // Grow the clip ~1px around the centroid so neighbouring triangles don't leave hairline cracks
-  const mx = (p0.x + p1.x + p2.x) / 3, my = (p0.y + p1.y + p2.y) / 3;
-  const grow = (q) => {
-    const dx = q.x - mx, dy = q.y - my, n = Math.hypot(dx, dy) || 1;
-    return [q.x + dx / n, q.y + dy / n];
-  };
-  ctx.save();
-  ctx.beginPath();
-  ctx.moveTo(...grow(p0));
-  ctx.lineTo(...grow(p1));
-  ctx.lineTo(...grow(p2));
-  ctx.closePath();
-  ctx.clip();
-  ctx.transform(a, b, c, d, p0.x - a * p0.ix - c * p0.iy, p0.y - b * p0.ix - d * p0.iy);
-  ctx.drawImage(img, 0, 0);
-  ctx.restore();
-}
-
-function drawNoSignal(ctx, w, h) {
-  ctx.fillStyle = '#020a04';
-  ctx.fillRect(0, 0, w, h);
-  ctx.strokeStyle = 'rgba(57,255,106,0.08)';
+  // Ground grid on the calibration plane (Z = 0), 2 m around the origin
+  ctx.strokeStyle = 'rgba(57,255,106,0.18)';
   ctx.lineWidth = 1;
-  const step = h / 12;
-  for (let x = (w / 2) % step; x < w; x += step) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
-  for (let y = (h / 2) % step; y < h; y += step) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
-}
-
-function handPoints(hand, t) {
-  return hand.map((p) => [t.ox + p.x * t.vw * t.s, t.oy + p.y * t.vh * t.s]);
-}
-
-function drawXray(w, h, t) {
-  // 1. Plain passthrough
-  eyeCtx.drawImage(video, t.ox, t.oy, t.vw * t.s, t.vh * t.s);
-
-  const hands = state.hands.map((hd) => handPoints(hd, t));
-
-  // 2. While no hands are visible, keep a clean plate of the scene for fallback fill
-  if (!hands.length) {
-    if (plate.width !== w || plate.height !== h) { plate.width = w; plate.height = h; }
-    plateCtx.drawImage(eye, 0, 0);
-    state.plateYaw = state.yaw;
-    state.platePitch = state.pitch;
-    state.plateValid = true;
-    return 0;
+  for (let i = -2; i <= 2; i += 0.5) {
+    stroke3(ctx, [[i, -2, 0], [i, 2, 0]]);
+    stroke3(ctx, [[-2, i, 0], [2, i, 0]]);
   }
 
-  // 3. Build what's "behind" the hands: room cameras first, clean plate if none are in view
-  fxCtx.globalCompositeOperation = 'source-over';
-  fxCtx.clearRect(0, 0, w, h);
-  let source;
-  const shown = drawDAS(fxCtx, w, h);
-  if (shown.length) {
-    source = shown[shown.length - 1].cam.info.name; // the best-aligned camera is drawn on top
-  } else {
-    if (state.plateValid) {
-      // Shift the plate to compensate for head rotation since it was captured
-      const ppd = focalPx(w) * DEG;
-      const dx = -wrap180(state.yaw - state.plateYaw) * ppd;
-      const dy = (state.pitch - state.platePitch) * ppd;
-      fxCtx.drawImage(plate, dx, dy);
-      source = 'MEM';
-    } else {
-      fxCtx.fillStyle = 'rgba(0,40,10,0.85)';
-      fxCtx.fillRect(0, 0, w, h);
-      source = 'NONE';
+  // Origin axes at the calibration spot: X right, Y along the arrow, Z up
+  ctx.lineWidth = Math.max(2, w / 400);
+  for (const [v, name, color] of [[[1, 0, 0], 'X', '#ff6b6b'], [[0, 1, 0], 'Y', HUD], [[0, 0, 1], 'Z', '#6bb8ff']]) {
+    ctx.strokeStyle = ctx.fillStyle = color;
+    stroke3(ctx, [[0, 0, 0], v.map((x) => x * 0.3)]);
+    label3(ctx, v.map((x) => x * 0.36), name);
+  }
+
+  if (bcn.p && bcn.trail.length) {
+    // Trail: fades with age, yellow where it was flying
+    const pts = bcn.trail;
+    for (let i = 1; i < pts.length; i++) {
+      const age = (now - pts[i].t) / (TRAIL_SECONDS * 1000);
+      ctx.globalAlpha = Math.max(0.1, 1 - age);
+      ctx.strokeStyle = pts[i].air ? PATH : HUD;
+      tube3(ctx, [pts[i - 1].p, pts[i].p], 0.008, 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // Shadow line down to the Z = 0 plane: shows height
+    const p = bcn.p;
+    ctx.strokeStyle = HUD_DIM;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 6]);
+    stroke3(ctx, [p, [p[0], p[1], 0]]);
+    ctx.setLineDash([]);
+    stroke3(ctx, Array.from({ length: 25 }, (_, i) => {
+      const a = (i / 24) * Math.PI * 2;
+      return [p[0] + 0.06 * Math.cos(a), p[1] + 0.06 * Math.sin(a), 0];
+    }));
+
+    // The beacon itself
+    const q = project(p);
+    if (q.z > NEAR) {
+      const r = Math.max(5, (cam.f * 0.03) / q.z);
+      ctx.fillStyle = bcn.air ? PATH : '#fff';
+      ctx.shadowColor = bcn.air ? PATH : HUD;
+      ctx.shadowBlur = 18;
+      ctx.beginPath();
+      ctx.arc(q.x, q.y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = HUD;
+      ctx.fillText(`BCN ${coord(p)}`, q.x, q.y - r - fs * 0.6);
+      ctx.fillText(`${len(sub(p, phone.p)).toFixed(2)} m`, q.x, q.y + r + fs * 0.9);
     }
   }
+  ctx.restore();
+}
 
-  // 4. Soft-edged hand silhouette
-  maskCtx.clearRect(0, 0, w, h);
-  maskCtx.save();
-  maskCtx.fillStyle = maskCtx.strokeStyle = '#fff';
-  maskCtx.shadowColor = '#fff';
-  maskCtx.shadowBlur = w / 40;
-  maskCtx.lineCap = maskCtx.lineJoin = 'round';
-  for (const pts of hands) {
-    const size = Math.hypot(pts[9][0] - pts[0][0], pts[9][1] - pts[0][1]);
-    maskCtx.beginPath();
-    PALM.forEach((i, k) => (k ? maskCtx.lineTo(...pts[i]) : maskCtx.moveTo(...pts[i])));
-    maskCtx.closePath();
-    maskCtx.fill();
-    maskCtx.lineWidth = size * 0.45;
-    maskCtx.stroke();
-    maskCtx.lineWidth = size * 0.28;
-    maskCtx.beginPath();
-    for (const [a, b] of BONES) { maskCtx.moveTo(...pts[a]); maskCtx.lineTo(...pts[b]); }
-    maskCtx.stroke();
-  }
-  maskCtx.restore();
-
-  fxCtx.globalCompositeOperation = 'destination-in';
-  fxCtx.drawImage(mask, 0, 0);
-  eyeCtx.drawImage(fx, 0, 0);
-
-  // 5. Wireframe skeleton over the now-invisible hand
-  eyeCtx.save();
-  eyeCtx.strokeStyle = HUD;
-  eyeCtx.fillStyle = HUD;
-  eyeCtx.lineWidth = Math.max(1.5, w / 500);
-  eyeCtx.shadowColor = HUD;
-  eyeCtx.shadowBlur = 6;
-  for (const pts of hands) {
-    eyeCtx.beginPath();
-    for (const [a, b] of BONES) { eyeCtx.moveTo(...pts[a]); eyeCtx.lineTo(...pts[b]); }
-    eyeCtx.stroke();
-    for (const i of [4, 8, 12, 16, 20]) {
-      eyeCtx.beginPath();
-      eyeCtx.arc(pts[i][0], pts[i][1], w / 180, 0, Math.PI * 2);
-      eyeCtx.fill();
-    }
-  }
-  eyeCtx.font = `${Math.round(h / 34)}px Menlo, monospace`;
-  eyeCtx.textAlign = 'center';
-  eyeCtx.fillText(`HAND TRANSPARENT // SRC ${source}`, w / 2, h * 0.86);
-  eyeCtx.restore();
-  return hands.length;
+// When the beacon is out of view, an arrow at the edge of the screen points to it
+function drawGuide(ctx, w, h) {
+  if (!bcn.p) return;
+  const q = project(bcn.p);
+  if (q.z > NEAR && Math.abs(q.x) < w * 0.42 && Math.abs(q.y) < h * 0.42) return;
+  // Direction on screen, valid even when the beacon is behind you
+  const rel = fromGraph(sub(bcn.p, phone.p));
+  let dx = dot(rel, cam.view.R), dy = -dot(rel, cam.view.U);
+  const n = Math.hypot(dx, dy) || 1;
+  dx /= n; dy /= n;
+  const r = Math.min(w, h) * 0.38, s = h / 28;
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  ctx.rotate(state.roll * DEG);
+  ctx.translate(dx * r, dy * r);
+  ctx.rotate(Math.atan2(dy, dx));
+  ctx.fillStyle = PATH;
+  ctx.shadowColor = 'rgba(0,0,0,0.9)';
+  ctx.shadowBlur = 6;
+  ctx.beginPath();
+  ctx.moveTo(s, 0); ctx.lineTo(-s * 0.6, -s * 0.7); ctx.lineTo(-s * 0.6, s * 0.7);
+  ctx.closePath();
+  ctx.fill();
+  ctx.rotate(-Math.atan2(dy, dx));
+  ctx.font = `${Math.round(h / 40)}px Menlo, monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText('BCN', -dx * s * 1.8, -dy * s * 1.8 + 4);
+  ctx.restore();
 }
 
 function drawHUD(ctx, w, h, now) {
   const cx = w / 2, cy = h / 2;
-  const f = focalPx(w);
-  const ppd = f * DEG; // pixels per degree near the center of view
+  const ppd = focalPx(w, h) * DEG; // pixels per degree near the center of view
   const fs = Math.round(h / 30);
+  const small = Math.round(fs * 0.75);
 
   ctx.save();
   ctx.strokeStyle = HUD;
@@ -747,6 +569,7 @@ function drawHUD(ctx, w, h, now) {
   ctx.clip();
   ctx.translate(cx, cy);
   ctx.rotate(state.roll * DEG);
+  ctx.globalAlpha = 0.4;
   for (let p = -90; p <= 90; p += 10) {
     const y = -(p - state.pitch) * ppd;
     if (Math.abs(y) > h * 0.45) continue;
@@ -756,11 +579,6 @@ function drawHUD(ctx, w, h, now) {
     ctx.beginPath();
     ctx.moveTo(-half, y); ctx.lineTo(-gap, y);
     ctx.moveTo(gap, y); ctx.lineTo(half, y);
-    if (p !== 0) {
-      const tick = p > 0 ? fs * 0.5 : -fs * 0.5;
-      ctx.moveTo(-half, y); ctx.lineTo(-half, y + tick);
-      ctx.moveTo(half, y); ctx.lineTo(half, y + tick);
-    }
     ctx.stroke();
     if (p !== 0) {
       ctx.textAlign = 'right'; ctx.fillText(Math.abs(p), -half - fs * 0.3, y);
@@ -782,7 +600,7 @@ function drawHUD(ctx, w, h, now) {
   const tps = tapeW / span;
   ctx.save();
   ctx.beginPath();
-  ctx.rect(cx - tapeW / 2, tapeY - fs * 2, tapeW, fs * 4.5);
+  ctx.rect(cx - tapeW / 2, tapeY - fs * 2, tapeW, fs * 2.5);
   ctx.clip();
   ctx.textAlign = 'center';
   const start = Math.ceil((state.yaw - span / 2) / 5) * 5;
@@ -794,36 +612,49 @@ function drawHUD(ctx, w, h, now) {
     ctx.stroke();
     if (major) ctx.fillText(String(wrap360(d)).padStart(3, '0'), x, tapeY - fs * 1.3);
   }
-  // Camera markers on the tape
-  ctx.font = `${Math.round(fs * 0.7)}px Menlo, monospace`;
-  for (const cam of state.cameras.values()) {
-    if (!cam.info) continue;
-    const x = cx + wrap180(camAim(cam)[0] - state.yaw) * tps;
-    ctx.fillStyle = cam.bitmap ? HUD : HUD_DIM;
-    ctx.beginPath();
-    ctx.moveTo(x, tapeY + fs * 0.3); ctx.lineTo(x - fs * 0.35, tapeY + fs * 0.9); ctx.lineTo(x + fs * 0.35, tapeY + fs * 0.9);
-    ctx.fill();
-    ctx.fillText(cam.info.name.slice(0, 10), x, tapeY + fs * 1.6);
-  }
   ctx.restore();
-  ctx.fillStyle = HUD;
-  ctx.font = `${fs}px Menlo, monospace`;
   ctx.textAlign = 'center';
   ctx.strokeRect(cx - fs * 1.6, tapeY + fs * 0.2, fs * 3.2, fs * 1.3);
   ctx.fillText(String(Math.round(wrap360(state.yaw))).padStart(3, '0'), cx, tapeY + fs * 0.85);
 
-  // Side data blocks
-  const live = [...state.cameras.values()].filter((c) => c.bitmap).length;
+  // Side data blocks: status on the left with the beacon's coordinates, the camera's on the right
+  const live = beaconLive(), bc = state.beacon;
+  const phase = !live ? 'NO LINK' : cal.yaw === null || !bc.cal ? 'UNCAL' : bcn.air ? 'FLIGHT' : bcn.still ? 'STILL' : 'MOVING';
   const lx = cx - w * 0.36, rx = cx + w * 0.36;
   ctx.textAlign = 'left';
-  ctx.fillText(MODES[state.mode], lx, cy - fs * 2);
-  ctx.fillText(`DAS ${live}/${state.cameras.size}`, lx, cy);
-  ctx.fillText(state.gotSensor ? 'IMU OK' : 'IMU --', lx, cy + fs * 2);
-  ctx.fillText(now - state.syncAt < 3000 ? `SYNC ${state.syncScore.toFixed(2)}` : 'SYNC --', lx, cy + fs * 4);
+  ctx.fillStyle = phase === 'FLIGHT' ? PATH : phase === 'NO LINK' || phase === 'UNCAL' ? '#ff5a3c' : HUD;
+  ctx.fillText(phase, lx, cy - fs * 2);
+  ctx.fillStyle = HUD;
+  ctx.fillText(!live ? 'LINK --' : bc.link === 'usb' ? 'LINK USB' : `LINK ${bc.rssi}`, lx, cy);
+  ctx.font = `${small}px Menlo, monospace`;
+  if (bcn.p) {
+    ctx.fillText('BCN', lx, cy + fs * 1.8);
+    bcn.p.forEach((v, i) => ctx.fillText(`${'XYZ'[i]}${fmt(v)}`, lx, cy + fs * (2.6 + i * 0.8)));
+  }
   ctx.textAlign = 'right';
+  ctx.fillText('CAM', rx, cy + fs * 1.8);
+  phone.p.forEach((v, i) => ctx.fillText(`${'XYZ'[i]}${fmt(v)}`, rx, cy + fs * (2.6 + i * 0.8)));
+  ctx.font = `${fs}px Menlo, monospace`;
   ctx.fillText(`P ${state.pitch >= 0 ? '+' : ''}${Math.round(state.pitch)}`, rx, cy - fs * 2);
-  ctx.fillText(`R ${Math.round(state.roll)}`, rx, cy);
-  ctx.fillText(`${state.fps} FPS`, rx, cy + fs * 2);
+  ctx.fillText(`${state.fps} FPS`, rx, cy);
+
+  // Last throw
+  const t = lastThrow;
+  if (t) {
+    ctx.textAlign = 'center';
+    ctx.fillStyle = PATH;
+    ctx.font = `${small}px Menlo, monospace`;
+    const horiz = Math.hypot(t.v[0], t.v[1]);
+    const parts = [`V0 ${len(t.v).toFixed(1)}m/s @ ${Math.round(Math.atan2(t.v[2], horiz) / DEG)}°`, `PEAK Z${fmt(t.peak)}`];
+    if (t.airtime) {
+      parts.push(`AIR ${t.airtime.toFixed(2)}s`, `DIST ${Math.hypot(t.p1[0] - t.p0[0], t.p1[1] - t.p0[1]).toFixed(2)}m`);
+      parts.push(`HIT ${t.impactG.toFixed(1)}g`);
+    } else {
+      parts.push('IN FLIGHT');
+    }
+    ctx.fillText(parts.join('   '), cx, h * 0.82);
+    ctx.fillStyle = HUD;
+  }
 
   // Corner brackets
   const m = w * 0.06, L = w * 0.06;
@@ -833,15 +664,26 @@ function drawHUD(ctx, w, h, now) {
   }
   ctx.stroke();
 
-  // Toast + controls hint
+  // Toast + guidance
   ctx.textAlign = 'center';
   if (now < state.toastUntil) {
-    ctx.font = `bold ${Math.round(fs * 1.4)}px Menlo, monospace`;
-    ctx.fillText(state.toast, cx, h * 0.72);
+    ctx.font = `bold ${Math.round(fs * 1.3)}px Menlo, monospace`;
+    ctx.fillText(state.toast, cx, h * 0.68);
   }
-  if (now < state.hintUntil) {
-    ctx.font = `${Math.round(fs * 0.75)}px Menlo, monospace`;
-    ctx.fillText('TAP: MODE   HOLD: RECENTER', cx, h * 0.93);
+  ctx.font = `${small}px Menlo, monospace`;
+  if (flat.since && !flat.done) {
+    // Counting down to an automatic calibration
+    const left = Math.max(1, Math.ceil((AUTO_CAL_MS - (now - flat.since)) / 1000));
+    ctx.font = `bold ${Math.round(fs * 1.6)}px Menlo, monospace`;
+    ctx.fillText(`CALIBRATING IN ${left}`, cx, h * 0.6);
+    ctx.font = `${small}px Menlo, monospace`;
+    ctx.fillText('KEEP PHONE AND BEACON STILL', cx, h * 0.93);
+  } else if (phase === 'UNCAL') {
+    ctx.fillText('LAY PHONE FACE UP ON BEACON, TOP EDGE ALONG Y ARROW', cx, h * 0.93);
+  } else if (phase === 'NO LINK') {
+    ctx.fillText('WAITING FOR BEACON', cx, h * 0.93);
+  } else if (now < state.hintUntil) {
+    ctx.fillText('TAP: CLEAR TRAIL   TOUCH BEACON TO PHONE + HOLD: RE-ZERO', cx, h * 0.93);
   }
   ctx.restore();
 }
@@ -851,22 +693,19 @@ let frames = 0, fpsT = 0;
 function frame(now) {
   requestAnimationFrame(frame);
   const dpr = resize();
-  updatePose();
-  updateHands(now);
-  autoSync(now);
+  updatePose(now);
+  autoCalibrate(now);
 
   const w = eye.width, h = eye.height;
-  eyeCtx.globalCompositeOperation = 'source-over';
   eyeCtx.clearRect(0, 0, w, h);
-
-  const mode = MODES[state.mode];
-  if (mode === 'DAS') {
-    drawNoSignal(eyeCtx, w, h);
-    drawDAS(eyeCtx, w, h);
-  } else if (video.videoWidth) {
+  if (video.videoWidth) {
     const t = videoTransform(w, h);
-    if (mode === 'XRAY') drawXray(w, h, t);
-    else eyeCtx.drawImage(video, t.ox, t.oy, t.vw * t.s, t.vh * t.s);
+    eyeCtx.drawImage(video, t.ox, t.oy, t.vw * t.s, t.vh * t.s);
+  }
+  setupCamera(w, h);
+  if (cal.yaw !== null) {
+    drawWorld(eyeCtx, w, h, now);
+    drawGuide(eyeCtx, w, h);
   }
   drawHUD(eyeCtx, w, h, now);
 
