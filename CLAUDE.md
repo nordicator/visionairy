@@ -58,6 +58,12 @@ At 500 Hz: gyro integration plus a Mahony-style gravity correction when near 1 g
 
 **Honest limit:** double-integrating a ~$3 IMU drifts while moving (cm to tens of cm after a few seconds). No library fixes this. Accurate continuous position needs an external reference such as UWB (DW3000), ultrasonic or Lighthouse. The user was told this and chose to go ahead with what they have. The old laptop's log showed questionable release velocities on tosses, so throw accuracy is unverified.
 
+## Drone following a throw path
+
+- iOS `DroneTracker.swift`: DRONE button, tap the drone; Vision tracks its box and LiDAR `sceneDepth` gives its depth, so it gets a 3D position in ARKit world. The app sends `{type:'drone', ok, world, path, p}`, where `p` is in the latest throw's path frame (origin = release spot, Z up, Y = throw direction) and `path` is that throw's `id`.
+- `drone/follow.py` (G in `drone.py`): a stdlib WebSocket client to :8080, a heading probe (the drone never yaws, so it pushes forward once to learn its axes), then a PD follow at 0.25 m/s. It lands when done, or when the drone fix has been missing for 3 s.
+- Tested only in simulation (`follow.py` against a lagged, rotated, drifting model: ~2 cm mean off-path). Not flown yet. The phone and laptop must share the drone's Wi-Fi; cheap drone APs may isolate clients.
+
 ## Setup on a new machine
 
 1. `npm install` and `npm start`. On macOS, `serialport` loads its prebuilt binding even though npm blocks install scripts.

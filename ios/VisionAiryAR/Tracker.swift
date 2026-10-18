@@ -21,6 +21,8 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
     @Published var countdown: Int?
     @Published var trackingText = ""
     @Published var pathText = ""
+    @Published var droneText = ""
+    @Published var droneArmed = false   // waiting for a tap on the drone
 
     let airpod = AirPodMotion()
 
@@ -52,6 +54,16 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
     // Throw path: phone touched to the bag at release and at landing, AirPod timing the flight
     private var throwStart: (pos: simd_float3, at: TimeInterval)?
     private let pathRoot = SCNNode()
+    /// The latest throw's path frame in ARKit world coordinates, so the drone can be reported in it
+    private var pathFrame: (id: String, origin: simd_float3, right: simd_float3, fwd: simd_float3)?
+
+    // The drone, found with the camera + LiDAR, and its trail in the AR view
+    private let drone = DroneTracker()
+    private let droneNode = SCNNode()
+    private let droneTrailRoot = SCNNode()
+    private var droneTrail: [(t: TimeInterval, node: SCNNode)] = []
+    private var lastDronePoint: simd_float3?
+    private var lastDroneSent: TimeInterval = 0
 
     private var lastThrow: (v: [Double], p0: [Double], peak: Double, air: Double?, hit: Double?, p1: simd_float3?)?
     private var lastPoseSent: TimeInterval = 0
@@ -64,6 +76,7 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
     static let beaconOffset = simd_float2(0.045, -0.015)
     private static let green = UIColor(red: 0.22, green: 1, blue: 0.42, alpha: 1)
     private static let yellow = UIColor(red: 1, green: 0.82, blue: 0.25, alpha: 1)
+    private static let cyan = UIColor(red: 0.3, green: 0.9, blue: 1, alpha: 1)
 
     override init() {
         let host = Bundle.main.object(forInfoDictionaryKey: "VAServerHost") as? String ?? "127.0.0.1"
@@ -71,6 +84,7 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
         super.init()
         buildScene()
         link.onMessage = { [weak self] msg in self?.handle(msg) }
+        drone.onUpdate = { [weak self] p, lost in self?.onDrone(p, lost: lost) }
     }
 
     func start() {
@@ -80,7 +94,9 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         config.planeDetection = [.horizontal, .vertical]
+        if DroneTracker.supported { config.frameSemantics.insert(.sceneDepth) }
         sceneView.session.run(config)
+        sceneView.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
         link.connect()
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
     }
@@ -90,6 +106,12 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
     private func buildScene() {
         sceneView.scene.rootNode.addChildNode(graphRoot)
         sceneView.scene.rootNode.addChildNode(pathRoot)
+        sceneView.scene.rootNode.addChildNode(droneTrailRoot)
+        let droneBall = SCNNode(geometry: SCNSphere(radius: 0.04))
+        droneBall.geometry?.firstMaterial = Self.material(Self.cyan.withAlphaComponent(0.35))
+        droneNode.addChildNode(droneBall)
+        droneNode.isHidden = true
+        sceneView.scene.rootNode.addChildNode(droneNode)
         graphRoot.isHidden = true
         graphRoot.addChildNode(trailRoot)
 
@@ -357,10 +379,12 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
             if let last { pathRoot.addChildNode(Self.segment(from: last, to: p, radius: 0.006, color: Self.yellow)) }
             last = p
         }
+        let id = ISO8601DateFormatter().string(from: Date())
+        pathFrame = (id, p0, right, fwd)
         let peak = points.map { $0[3] }.max() ?? 0
         let dist = simd_length(simd_float2(p1.x - p0.x, p1.z - p0.z))
         let vFwd = simd_dot(v, fwd)
-        link.send(["type": "path", "airtime": T, "v0": [simd_dot(v, right), vFwd, v.y],
+        link.send(["type": "path", "id": id, "airtime": T, "v0": [simd_dot(v, right), vFwd, v.y],
                    "frame": "origin = release spot, Z up, Y = throw direction, X right (m, s)",
                    "points": points, "world": world])
         pathText = String(format: "AIR %.2fs   DIST %.2fm   PEAK +%.2fm   V0 %.1f m/s @ %.0f°",
@@ -368,9 +392,93 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
         throwStart = nil
     }
 
+    // MARK: - Drone
+
+    /// DRONE button: arm a tap on the drone, or stop tracking it
+    func toggleDrone() {
+        guard DroneTracker.supported else { return show("NEEDS A LIDAR IPHONE") }
+        if drone.active || droneArmed {
+            droneArmed = false
+            drone.stop()
+            droneTrail.forEach { $0.node.removeFromParentNode() }
+            droneTrail.removeAll()
+            lastDronePoint = nil
+            droneText = ""
+        } else {
+            droneArmed = true
+            droneText = "TAP THE DRONE"
+        }
+    }
+
+    @objc private func tapped(_ g: UITapGestureRecognizer) {
+        guard droneArmed, let frame = sceneView.session.currentFrame else { return }
+        let size = sceneView.bounds.size
+        let p = g.location(in: sceneView)
+        // Screen point -> normalized captured-image point
+        let t = frame.displayTransform(for: .portrait, viewportSize: size).inverted()
+        let img = CGPoint(x: p.x / size.width, y: p.y / size.height).applying(t)
+        guard (0...1).contains(img.x), (0...1).contains(img.y) else { return }
+        droneArmed = false
+        droneText = "LOCKING ON"
+        drone.select(img)
+    }
+
+    private func onDrone(_ world: simd_float3?, lost: Bool) {
+        guard let w = world else {
+            if lost && drone.active && !droneArmed {
+                droneNode.isHidden = true
+                droneArmed = true
+                droneText = "DRONE LOST // TAP IT AGAIN"
+            }
+            sendDrone(nil)
+            return
+        }
+        droneNode.isHidden = false
+        droneNode.simdPosition = w
+        if let last = lastDronePoint {
+            if simd_distance(last, w) > 0.01 {
+                let seg = Self.segment(from: last, to: w, radius: 0.004, color: Self.cyan)
+                droneTrailRoot.addChildNode(seg)
+                droneTrail.append((now, seg))
+                lastDronePoint = w
+            }
+        } else {
+            lastDronePoint = w
+        }
+        while let first = droneTrail.first, now - first.t > 20 {
+            first.node.removeFromParentNode()
+            droneTrail.removeFirst()
+        }
+        let p = pathPoint(w)
+        droneText = p.map { "DRONE " + Self.xyz($0) } ?? "DRONE FOUND // THROW FIRST FOR A PATH"
+        sendDrone(w)
+    }
+
+    /// World point -> the latest throw's path frame (origin = release spot, Z up, Y = throw direction)
+    private func pathPoint(_ w: simd_float3) -> simd_float3? {
+        guard let f = pathFrame else { return nil }
+        let d = w - f.origin
+        return simd_float3(simd_dot(d, f.right), simd_dot(d, f.fwd), d.y)
+    }
+
+    private func sendDrone(_ w: simd_float3?) {
+        guard w == nil || now - lastDroneSent > 0.04 else { return }
+        lastDroneSent = now
+        var msg: [String: Any] = ["type": "drone", "ok": w != nil]
+        if let w {
+            msg["world"] = [w.x, w.y, w.z]
+            if let f = pathFrame, let p = pathPoint(w) {
+                msg["path"] = f.id
+                msg["p"] = [p.x, p.y, p.z]
+            }
+        }
+        link.send(msg)
+    }
+
     // MARK: - Per frame
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        drone.process(frame)
         guard calibrated else { return }
         // Camera pose in the graph frame
         let cam = graphRoot.simdWorldTransform.inverse * portraitPose(frame)
