@@ -123,6 +123,16 @@ The spot is tracked in the video while the drone moves. It stops when it gets th
 | Left-click on video | Fly to that spot |
 | Right-click | Cancel |
 
+### Follow a throw path (G)
+
+Flies the arc of the latest throw from the iOS app, slowed down to 0.25 m/s, with the iPhone's camera + LiDAR telling it where it is (`follow.py`). Needs `npm start` running on this laptop, and the phone and laptop on the same network (the drone's Wi-Fi: re-run `ios/build.sh` while on it so the app has the right address).
+
+1. In the app: THROW START / throw / LANDED, as usual. Don't restart the app after this; the path only lines up within the same session.
+2. Take off (`T`). In the app tap **DRONE**, then tap the drone on screen. Keep it in view, within about 4 m.
+3. Press `G`. The drone pushes forward briefly to learn which way it faces, flies to the start of the arc, follows it and lands.
+
+Any movement key or `G` cancels. If the phone loses the drone for 3 s it lands.
+
 ### Trim (drift correction)
 
 | Key | Action |

@@ -277,6 +277,7 @@ HELP_ROWS = (("W A S D", "move"), ("UP / DOWN  (R / F)", "climb / descend"), ("T
              ("L", "land"), ("SPACE", "motors off"), ("C", "gyro calibrate (on the ground)"),
              ("H", "headless mode on / off"), ("SHIFT + move key", "nudge trim"),
              ("K", "auto-trim on / off"), ("BACKSPACE", "reset trim"), ("CLICK", "fly to that spot"),
+             ("G", "follow the throw path (iOS app tracks the drone)"),
              ("P / V", "photo / record"), ("O / Z", "object boxes / depth view"),
              ("M", "depth calibration (wall at --cal-distance)"), ("?", "hide this"), ("ESC", "quit"))
 

@@ -68,9 +68,14 @@ struct ContentView: View {
                         .lineLimit(2).minimumScaleFactor(0.7)
                 }
 
+                if !tracker.droneText.isEmpty {
+                    Text(tracker.droneText).font(.system(.caption, design: .monospaced))
+                        .foregroundColor(Color(red: 0.3, green: 0.9, blue: 1)).lineLimit(1).minimumScaleFactor(0.7)
+                }
                 HStack(spacing: 10) {
                     button("THROW START") { tracker.markThrowStart() }
                     button("LANDED") { tracker.markLanding() }
+                    button(tracker.droneArmed ? "TAP IT" : "DRONE") { tracker.toggleDrone() }
                 }
                 HStack(spacing: 10) {
                     button("SYNC") { tracker.sync() }

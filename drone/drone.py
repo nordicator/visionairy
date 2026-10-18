@@ -14,6 +14,7 @@ Keys (in the video window) – hold a movement key to push harder, let go to sto
   ? show/hide the key list   ESC quit
   Z depth view on/off   M depth calibration: camera square to a wall --cal-distance m away (1 m)
   CLICK the video to fly there, same height (see target.py)   RIGHT-CLICK or a movement key cancels
+  G follow the latest throw path, steered by the iOS app's camera + LiDAR (see follow.py); G again cancels
   SPEED 1/2/3: click the buttons in the window (no key)
 Photos and recordings go to the media/ folder next to this script.
 
@@ -49,6 +50,7 @@ try:
     import cv2
     import numpy as np
     import drift
+    import follow
     import hud
     import obstacles
     import depth
@@ -222,8 +224,9 @@ class Pilot:
 
 class Link:
     def __init__(self, variant, fly, save_dir, verbose, camera="forward", autotrim=True, objects=True,
-                 model="tiny", depth="fast", cal_distance=1.0):
+                 model="tiny", depth="fast", cal_distance=1.0, server="127.0.0.1"):
         self.variant, self.fly, self.save_dir, self.verbose = variant, fly, save_dir, verbose
+        self.server = server
         self.camera, self.autotrim, self.objects, self.model = camera, autotrim, objects, model
         self.depth, self.cal_distance = depth, cal_distance
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -415,6 +418,7 @@ class Link:
         saved_trim = self.pilot.trims()
         last_input = last_drift_log = 0.0
         goto = target.ClickTarget(self.camera)
+        tracker = follow.PathFollower(follow.ServerFeed(self.server, log=self.log)) if self.fly else None
         obs = obstacles.ObstacleTracker(self.camera, self.model, self.log, self.depth)
         obs.enabled = self.objects
         clicks = []                     # (button, canvas x, canvas y) from the mouse callback
@@ -486,7 +490,19 @@ class Link:
             clicks.clear()
             if self.fly:
                 going = goto.state
-                if goto.active and (any(held.values()) or airborne is None):
+                if tracker.active and (any(held.values()) or airborne is None):
+                    tracker.cancel()
+                    self.pilot.steer(dict.fromkeys(AXES, 0.0))
+                    toast("follow cancelled")
+                if tracker.active:
+                    self.pilot.steer(tracker.command(now))
+                    last_input = now
+                    if not tracker.active:              # finished, or lost the drone: land it
+                        self.pilot.steer(dict.fromkeys(AXES, 0.0))
+                        self.pilot.pulse(FLAG_LAND)
+                        flight_start = None
+                        toast("path done – landing" if tracker.state == "done" else f"follow stopped: {tracker.why} – landing")
+                elif goto.active and (any(held.values()) or airborne is None):
                     goto.cancel()
                     toast("go-to cancelled")
                 elif goto.active and age is not None and age > 1.5:
@@ -494,7 +510,7 @@ class Link:
                 if goto.active:
                     self.pilot.steer(goto.command(now, age is not None and age < 0.5))
                     last_input = now                    # auto-trim waits, then recalibrates
-                else:
+                elif not tracker.active:
                     self.pilot.update(held, now - last_t)
                 if going == "tracking" and goto.state in ("arrived", "lost", "timeout"):
                     self.pilot.steer(dict.fromkeys(AXES, 0.0))
@@ -547,7 +563,7 @@ class Link:
                 "ahead": obs.ahead_info() if obs.enabled and img is not None else (None, False),
                 "depth_img": obs.depth_map.colour((img.shape[1], img.shape[0]))
                 if show_depth and obs.depth_map is not None and img is not None else None,
-                "toasts": [m for m, _ in reversed(toasts)],
+                "toasts": ([tracker.status()] if tracker and tracker.active else []) + [m for m, _ in reversed(toasts)],
             }
             canvas = hud.fit(img)
             hud.draw(canvas, state)
@@ -572,6 +588,20 @@ class Link:
                 self.pilot.adjust_trim(axis, d * TRIM_STEP)
                 t = self.pilot.trims()
                 toast(f"trim  X {t['x']:+.0f}  Y {t['y']:+.0f}  Z {t['z']:+.0f}")
+            elif self.fly and k == ord("g"):
+                if tracker.active:
+                    tracker.cancel()
+                    self.pilot.steer(dict.fromkeys(AXES, 0.0))
+                    toast("follow cancelled")
+                elif flight_start is None:
+                    toast("take off first, then press G")
+                else:
+                    err = tracker.start(now)
+                    if err:
+                        toast(f"can't follow: {err}")
+                    else:
+                        goto.cancel()
+                        toast("following the throw path – any movement key cancels")
             elif self.fly and k == ord("k"):
                 auto.enabled = not auto.enabled
                 toast("auto-trim " + ("on" if auto.enabled else "off"))
@@ -651,6 +681,8 @@ def main():
     ap.add_argument("--hfov", type=float, metavar="DEG",
                     help="camera field of view for depth, until calibrate_camera.py has measured it "
                          "(default: 90 for the drone, 65 for a webcam)")
+    ap.add_argument("--server", default="127.0.0.1",
+                    help="laptop running server.js, for G (follow a throw path); default this laptop")
     args = ap.parse_args()
 
     if args.webcam is not None and cv2 is None:
@@ -675,7 +707,7 @@ def main():
 
     link = Link(variant, fly, args.save, args.verbose, args.camera, not args.no_autotrim, not args.no_objects,
                 None if args.model == "off" else args.model, None if args.depth == "off" else args.depth,
-                args.cal_distance)
+                args.cal_distance, args.server)
     if variant == "webcam":
         link.log(f"webcam {args.webcam} test - no drone, no flight commands. ? shows the keys, ESC quits")
         threads = [threading.Thread(target=link.video_webcam, args=(args.webcam,), daemon=True)]

@@ -188,6 +188,8 @@ function onClient(ws) {
       if (msg.type === 'cmd' && ['cal', 'zero', 'on', 'off', 'blink'].includes(msg.cmd)) sendToBeacon(msg.cmd);
       // The headset phone's own tracked pose, relayed to the 3D graph on the laptop
       if (msg.type === 'phone') broadcast(msg);
+      // The drone's position as the iOS app sees it (camera + LiDAR), for drone/drone.py to follow a path
+      if (msg.type === 'drone') broadcast(msg);
       // A throw's arc from the iOS app, saved for the drone to fly later
       if (msg.type === 'path') {
         const dir = path.join(__dirname, 'paths');
