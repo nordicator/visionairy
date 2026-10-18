@@ -4,3 +4,4 @@ node_modules/
 esp32/beacon/secrets.h
 ios/*.xcodeproj/
 ios/build/
+paths/

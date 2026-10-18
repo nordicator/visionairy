@@ -10,8 +10,8 @@ targets:
     sources: [VisionAiryAR]
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.cdx.visionairy.ar
-        DEVELOPMENT_TEAM: 464MGJA3HD
+        PRODUCT_BUNDLE_IDENTIFIER: ca.smallwoken.vision
+        DEVELOPMENT_TEAM: Y3B7W354V4
         CODE_SIGN_STYLE: Automatic
         INFOPLIST_FILE: VisionAiryAR/Info.plist
         GENERATE_INFOPLIST_FILE: NO

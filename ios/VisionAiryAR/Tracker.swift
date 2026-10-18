@@ -6,8 +6,8 @@ import simd
 /// ARKit tracks the phone (camera + motion sensors, millimetre-level), the beacon streams its own
 /// IMU-tracked position, and calibration ties the two together.
 ///
-/// Graph frame (shared with the beacon and /graph on the laptop): origin = calibration spot, Z up,
-/// Y = the beacon's Y arrow (= the phone's top edge at calibration), X = right. `graphRoot` is a node
+/// Graph frame (shared with the beacon and /graph on the laptop): origin = where the beacon sat at sync,
+/// Z up, Y = the beacon's Y arrow (= the phone's top edge at sync), X = right. `graphRoot` is a node
 /// placed in the AR world with exactly that frame, so beacon coordinates go straight onto its children.
 final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDelegate {
     // What the overlay shows
@@ -20,6 +20,9 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
     @Published var toast = ""
     @Published var countdown: Int?
     @Published var trackingText = ""
+    @Published var pathText = ""
+
+    let airpod = AirPodMotion()
 
     let sceneView = ARSCNView()
     private let link: BeaconLink
@@ -40,19 +43,25 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
     private var heartbeat: [String: Any] = [:]
     private var heartbeatAt: TimeInterval = 0
 
-    // Auto-calibration: phone held flat, screen up, with the beacon lying on it
-    private var flatSince: TimeInterval?
-    private var flatPos = simd_float3()
-    private var flatTop = simd_float3()
-    private var flatDone = false
+    // Sync: phone flat with the beacon beside its right edge. The phone's pose is captured at the tap, then
+    // the beacon has to stay put for syncSeconds while it calibrates; the phone is free to move meanwhile.
     private var pendingCal: (pos: simd_float3, top: simd_float3)?
+    private var syncStarted: TimeInterval?
+    private var calSent = false
+
+    // Throw path: phone touched to the bag at release and at landing, AirPod timing the flight
+    private var throwStart: (pos: simd_float3, at: TimeInterval)?
+    private let pathRoot = SCNNode()
 
     private var lastThrow: (v: [Double], p0: [Double], peak: Double, air: Double?, hit: Double?, p1: simd_float3?)?
     private var lastPoseSent: TimeInterval = 0
     private var toastUntil: TimeInterval = 0
 
     static let trailSeconds: TimeInterval = 6
-    static let autoCalSeconds: TimeInterval = 2
+    static let syncSeconds: TimeInterval = 5
+    /// The beacon's centre relative to the phone's camera at sync, in the phone's portrait axes (x right,
+    /// y toward the top edge): beacon touching the phone's right edge, tops lined up.
+    static let beaconOffset = simd_float2(0.045, -0.015)
     private static let green = UIColor(red: 0.22, green: 1, blue: 0.42, alpha: 1)
     private static let yellow = UIColor(red: 1, green: 0.82, blue: 0.25, alpha: 1)
 
@@ -80,6 +89,7 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
 
     private func buildScene() {
         sceneView.scene.rootNode.addChildNode(graphRoot)
+        sceneView.scene.rootNode.addChildNode(pathRoot)
         graphRoot.isHidden = true
         graphRoot.addChildNode(trailRoot)
 
@@ -205,11 +215,12 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
             if msg["result"] as? String == "ok", let cal = pendingCal {
                 setGraphFrame(origin: cal.pos, top: cal.top)
                 calibrated = true
-                show("CALIBRATED // ORIGIN SET")
+                endSync("SYNCED // ORIGIN SET")
             } else if msg["result"] as? String == "moving" {
-                show("BEACON MOVED // TRY AGAIN")
+                endSync("BEACON MOVED // SYNC AGAIN")
+            } else {
+                pendingCal = nil
             }
-            pendingCal = nil
         case "zero":
             clearTrail()
         case "launch":
@@ -246,14 +257,40 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
         clearTrail()
     }
 
-    func calibrateNow() {
+    func sync() {
         guard let frame = sceneView.session.currentFrame else { return }
         let pose = portraitPose(frame)
-        guard pose.columns.2.y > 0.85 else { return show("HOLD THE PHONE FLAT, SCREEN UP") }
+        guard pose.columns.2.y > 0.85 else { return show("LAY THE PHONE FLAT, SCREEN UP") }
         guard beaconLive else { return show("NO BEACON LINK") }
-        pendingCal = (simd_make_float3(pose.columns.3), simd_make_float3(pose.columns.1))
-        link.send(["type": "cmd", "cmd": "cal"])
-        show("CALIBRATING // HOLD STILL")
+        let right = simd_make_float3(pose.columns.0), top = simd_make_float3(pose.columns.1)
+        let origin = simd_make_float3(pose.columns.3) + right * Self.beaconOffset.x + top * Self.beaconOffset.y
+        pendingCal = (origin, top)
+        syncStarted = now
+        calSent = false
+        countdown = Int(Self.syncSeconds)
+    }
+
+    private func endSync(_ message: String) {
+        pendingCal = nil
+        syncStarted = nil
+        countdown = nil
+        show(message)
+    }
+
+    /// Runs on the overlay timer while syncing: abort if the beacon moves, and ask it to calibrate at the end
+    /// of the window so it measures its biases while it's been sitting still the longest.
+    private func syncStep() {
+        guard let started = syncStarted else { return }
+        let elapsed = now - started
+        let beaconMoved = !beaconLive || (heartbeat["spin"] as? Double ?? 99) > 12 || (heartbeat["airborne"] as? Bool ?? false)
+        if beaconMoved && !calSent { return endSync("BEACON MOVED // SYNC AGAIN") }
+        // The beacon averages 0.8 s, so start it just in time to finish when the countdown does
+        if !calSent && elapsed >= Self.syncSeconds - 0.8 {
+            calSent = true
+            link.send(["type": "cmd", "cmd": "cal"])
+        }
+        if elapsed > Self.syncSeconds + 3 { return endSync("NO REPLY FROM BEACON") }
+        countdown = max(1, Int(ceil(Self.syncSeconds - elapsed)))
     }
 
     /// Beacon touching the phone: both are at the same point, so move the origin here and zero the beacon.
@@ -277,39 +314,63 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
 
     private var beaconLive: Bool { now - heartbeatAt < 3 }
 
-    private func autoCalibrate(_ frame: ARFrame) {
-        let pose = portraitPose(frame)
-        let pos = simd_make_float3(pose.columns.3), top = simd_make_float3(pose.columns.1)
-        let flat = pose.columns.2.y > 0.93
-        let trackingOK: Bool = { if case .normal = frame.camera.trackingState { return true }; return false }()
-        let beaconQuiet = beaconLive && (heartbeat["spin"] as? Double ?? 99) < 12 && !(heartbeat["airborne"] as? Bool ?? false)
-        guard flat, trackingOK, beaconQuiet else {
-            if !flat { flatDone = false }
-            flatSince = nil
-            countdown = nil
-            return
+    // MARK: - Throw path
+
+    /// Phone touching the bag where it'll be released. Throw within a couple of seconds after this.
+    func markThrowStart() {
+        guard let frame = sceneView.session.currentFrame else { return }
+        if !airpod.running { airpod.start() }
+        guard airpod.streaming else { return show("AIRPOD NOT STREAMING") }
+        throwStart = (simd_make_float3(portraitPose(frame).columns.3), ProcessInfo.processInfo.systemUptime)
+        pathRoot.childNodes.forEach { $0.removeFromParentNode() }
+        pathText = "START MARKED // THROW, THEN TOUCH THE BAG AND TAP LANDED"
+    }
+
+    /// Phone touching the bag where it first hit. A thrown bag is ballistic, so the start point, this point and
+    /// the airtime pin down the whole arc: p(t) = p0 + v t + ½ g t², with v solved from p(T) = p1.
+    func markLanding() {
+        guard let start = throwStart, let frame = sceneView.session.currentFrame else { return show("TAP THROW START FIRST") }
+        // The first real flight after the start tap; later short ones are bounces
+        guard let fall = airpod.falls.first(where: { $0.start > start.at && $0.airtime > 0.15 }) else {
+            return show("NO THROW DETECTED")
         }
-        // Held by hand, so allow a little wobble, but restart the countdown if it really moves
-        if flatSince == nil || simd_distance(pos, flatPos) > 0.03 || simd_dot(simd_normalize(top), simd_normalize(flatTop)) < 0.998 {
-            flatSince = now
-            flatPos = pos
-            flatTop = top
+        let p0 = start.pos, p1 = simd_make_float3(portraitPose(frame).columns.3)
+        let T = Float(fall.airtime)
+        let g = simd_float3(0, -9.81, 0)  // ARKit world: Y up
+        let v = (p1 - p0 - 0.5 * g * T * T) / T
+
+        // Path frame for the drone: origin = release spot, Z up, Y = horizontal direction of the throw, X right
+        let up = simd_float3(0, 1, 0)
+        var fwd = simd_float3(p1.x - p0.x, 0, p1.z - p0.z)
+        fwd = simd_length(fwd) > 0.01 ? simd_normalize(fwd) : simd_float3(0, 0, -1)
+        let right = simd_cross(fwd, up)
+
+        var points: [[Float]] = [], world: [[Float]] = []
+        var last: simd_float3?
+        let steps = max(2, Int(T * 30))
+        for i in 0...steps {
+            let t = T * Float(i) / Float(steps)
+            let p = p0 + v * t + 0.5 * g * t * t
+            let d = p - p0
+            points.append([t, simd_dot(d, right), simd_dot(d, fwd), d.y])
+            world.append([t, p.x, p.y, p.z])
+            if let last { pathRoot.addChildNode(Self.segment(from: last, to: p, radius: 0.006, color: Self.yellow)) }
+            last = p
         }
-        guard !flatDone, let since = flatSince else { countdown = nil; return }
-        let left = Self.autoCalSeconds - (now - since)
-        if left <= 0 {
-            flatDone = true
-            countdown = nil
-            calibrateNow()
-        } else {
-            countdown = Int(ceil(left))
-        }
+        let peak = points.map { $0[3] }.max() ?? 0
+        let dist = simd_length(simd_float2(p1.x - p0.x, p1.z - p0.z))
+        let vFwd = simd_dot(v, fwd)
+        link.send(["type": "path", "airtime": T, "v0": [simd_dot(v, right), vFwd, v.y],
+                   "frame": "origin = release spot, Z up, Y = throw direction, X right (m, s)",
+                   "points": points, "world": world])
+        pathText = String(format: "AIR %.2fs   DIST %.2fm   PEAK +%.2fm   V0 %.1f m/s @ %.0f°",
+                          T, dist, peak, simd_length(v), atan2(v.y, vFwd) * 180 / .pi)
+        throwStart = nil
     }
 
     // MARK: - Per frame
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        autoCalibrate(frame)
         guard calibrated else { return }
         // Camera pose in the graph frame
         let cam = graphRoot.simdWorldTransform.inverse * portraitPose(frame)
@@ -340,6 +401,7 @@ final class Tracker: NSObject, ObservableObject, ARSCNViewDelegate, ARSessionDel
     // MARK: - Overlay text
 
     private func tick() {
+        syncStep()
         let hb = beaconLive ? heartbeat : [:]
         linkText = !link.connected ? "NO SERVER" : hb.isEmpty ? "NO BEACON" : (hb["link"] as? String == "usb" ? "BEACON USB" : "BEACON WI-FI")
         phase = hb.isEmpty ? "--" : !calibrated || !beaconCal ? "UNCAL" : beaconAir ? "FLIGHT" : beaconStill ? "STILL" : "MOVING"

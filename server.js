@@ -188,10 +188,21 @@ function onClient(ws) {
       if (msg.type === 'cmd' && ['cal', 'zero', 'on', 'off', 'blink'].includes(msg.cmd)) sendToBeacon(msg.cmd);
       // The headset phone's own tracked pose, relayed to the 3D graph on the laptop
       if (msg.type === 'phone') broadcast(msg);
+      // A throw's arc from the iOS app, saved for the drone to fly later
+      if (msg.type === 'path') {
+        const dir = path.join(__dirname, 'paths');
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, `throw-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+        fs.writeFileSync(file, JSON.stringify({ savedAt: new Date().toISOString(), ...msg }, null, 1));
+        console.log(`saved ${path.relative(__dirname, file)} (${msg.points.length} points, ${msg.airtime.toFixed(2)} s)`);
+        broadcast(msg);
+      }
     } catch {}
   });
 }
 wss.on('connection', onClient);
+// Keep-alive: the iOS app treats 2 s of silence as "no server", and with no beacon attached nothing else is sent
+setInterval(() => broadcast({ type: 'tick' }), 1000);
 appWss.on('connection', onClient);
 appServer.listen(APP_PORT, '0.0.0.0');
 

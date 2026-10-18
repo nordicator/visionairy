@@ -13,7 +13,8 @@ APP=build/Build/Products/Debug-iphoneos/VisionAiryAR.app
 echo "Built $APP (server $HOST)"
 
 # Whichever paired iPhone is reachable right now (the list also keeps phones that are offline)
-DEVICE=$(xcrun devicectl list devices 2>/dev/null | awk '/iPhone/ && !/unavailable/ {print $3; exit}')
+# (the hostname column can be blank, so pick the identifier out by its shape rather than its column)
+DEVICE=$(xcrun devicectl list devices 2>/dev/null | awk '/iPhone/ && !/unavailable/ {for (i = 1; i <= NF; i++) if ($i ~ /^[0-9A-F]+-[0-9A-F-]+$/) {print $i; exit}}')
 if [ -z "$DEVICE" ]; then echo "No iPhone connected: plug it in (or join the same Wi-Fi) and re-run"; exit 1; fi
 xcrun devicectl device install app --device "$DEVICE" "$APP"
-xcrun devicectl device process launch --device "$DEVICE" com.cdx.visionairy.ar || true
+xcrun devicectl device process launch --device "$DEVICE" ca.smallwoken.vision || true

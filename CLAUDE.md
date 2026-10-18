@@ -45,9 +45,9 @@ The server turns these into WebSocket JSON (`bstate`, `beacon`, `imu`) for every
 ## Coordinate frame (shared by everything)
 
 - Origin = the calibration spot. Z up, Y = the IMU's printed Y arrow at calibration (= the phone's top edge), X = Y × Z (right). Metres.
-- **Calibration (ios app):** hold the phone flat, screen up, at waist height, with the beacon lying on the screen and its Y arrow toward the top of the phone. Hold 2 s and it auto-calibrates.
-  - The phone sends `cal`. The beacon averages 0.8 s to get gyro bias, accel scale and up. On `cal ok` the app sets a `graphRoot` node at the phone's pose.
-  - Do it handheld rather than lying on a table: the table covers the camera and ARKit loses tracking.
+- **Sync (ios app):** lay the phone flat, screen up, with the beacon touching its right edge, tops lined up and the beacon's Y arrow parallel to the phone's top. Tap SYNC, then leave the beacon still for 5 s; the phone can move.
+  - The phone's pose is captured at the tap; the origin is offset from the camera to the beacon's centre (`Tracker.beaconOffset`). The app sends `cal` 0.8 s before the 5 s are up, so the beacon averages its last 0.8 s of rest. On `cal ok` the app sets `graphRoot` there. If the beacon's spin goes above 12 °/s during the wait, the sync is cancelled.
+  - The user found the old flow (beacon lying on the phone's screen, auto-calibrating after 2 s) awkward.
 - **Re-zero:** touch the beacon to the phone and tap RE-ZERO. The beacon's position resets to 0 and the origin moves to the phone. This clears drift.
 
 ## How the beacon tracks (esp32/beacon/beacon.ino)

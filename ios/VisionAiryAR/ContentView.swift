@@ -33,10 +33,10 @@ struct ContentView: View {
                 Spacer()
 
                 if let n = tracker.countdown {
-                    Text("CALIBRATING IN \(n)").font(.system(.title, design: .monospaced).bold())
-                    Text("HOLD STILL").font(.system(.caption, design: .monospaced))
-                } else if tracker.phase == "UNCAL" {
-                    Text("To calibrate: hold the phone flat, screen up, at waist height, and lay the beacon on the screen with its Y arrow pointing to the top of the phone. Hold still for 2 seconds.")
+                    Text("SYNCING \(n)").font(.system(.title, design: .monospaced).bold())
+                    Text("DON'T TOUCH THE BEACON // PHONE CAN MOVE").font(.system(.caption, design: .monospaced))
+                } else if tracker.phase == "UNCAL" && !tracker.airpod.running {
+                    Text("To sync: lay the phone flat, screen up, with the beacon touching its right edge, tops lined up and the Y arrow pointing the same way as the top of the phone. Tap SYNC, then leave the beacon alone for 5 seconds.")
                         .font(.system(.footnote, design: .monospaced))
                         .multilineTextAlignment(.center)
                         .padding(10)
@@ -62,8 +62,18 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.black.opacity(0.55))
 
+                AirPodPanel(airpod: tracker.airpod)
+                if !tracker.pathText.isEmpty {
+                    Text(tracker.pathText).font(.system(.caption, design: .monospaced)).foregroundColor(pathYellow)
+                        .lineLimit(2).minimumScaleFactor(0.7)
+                }
+
                 HStack(spacing: 10) {
-                    button("CALIBRATE") { tracker.calibrateNow() }
+                    button("THROW START") { tracker.markThrowStart() }
+                    button("LANDED") { tracker.markLanding() }
+                }
+                HStack(spacing: 10) {
+                    button("SYNC") { tracker.sync() }
                     button("RE-ZERO") { tracker.rezero() }
                     button("CLEAR") { tracker.clearTrail() }
                 }
@@ -77,7 +87,7 @@ struct ContentView: View {
         .onAppear { tracker.start() }
     }
 
-    private func row(_ label: String, _ value: String, _ color: Color) -> some View {
+    func row(_ label: String, _ value: String, _ color: Color) -> some View {
         HStack {
             Text(label).opacity(0.7)
             Spacer()
@@ -85,7 +95,7 @@ struct ContentView: View {
         }
     }
 
-    private func button(_ title: String, action: @escaping () -> Void) -> some View {
+    func button(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
                 .font(.system(.footnote, design: .monospaced).bold())
@@ -94,6 +104,30 @@ struct ContentView: View {
                 .overlay(RoundedRectangle(cornerRadius: 4).stroke(hud, lineWidth: 1.5))
         }
         .background(.black.opacity(0.5))
+    }
+}
+
+/// AirPod motion readout (its own view so it refreshes on the AirPod's updates)
+struct AirPodPanel: View {
+    @ObservedObject var airpod: AirPodMotion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text("AIRPOD").opacity(0.7)
+                Spacer()
+                Text(airpod.status)
+                Button(airpod.running ? "OFF" : "ON") { airpod.toggle() }.padding(.leading, 8)
+            }
+            if airpod.running {
+                HStack { Text("RATE / ACCEL").opacity(0.7); Spacer(); Text(String(format: "%.0f Hz   %.2f g", airpod.rateHz, airpod.accelG)) }
+                HStack { Text("LAST AIRTIME").opacity(0.7); Spacer(); Text(airpod.lastAirtime.map { String(format: "%.3f s", $0) } ?? "--") }
+            }
+        }
+        .font(.system(.caption, design: .monospaced))
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.black.opacity(0.55))
     }
 }
 
