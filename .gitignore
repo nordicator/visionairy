@@ -1,7 +1,7 @@
 node_modules/
 .cert/
 .env
-esp32/beacon/secrets.h
+esp32/*/secrets.h
 ios/*.xcodeproj/
 ios/build/
 paths/
