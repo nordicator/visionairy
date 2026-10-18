@@ -9,8 +9,10 @@ is moving, in frame-widths per second:
                    scene slides down  -> drone moving up (+Z)
   down camera:     scene slides left  -> right (+X), slides down -> forward (+Y), shrinks -> up (+Z)
 
-AutoTrim watches that estimate while the pilot holds no movement keys and slowly walks a stick
-offset (trim) against the drift until it stops, like tapping the app's trim buttons for you.
+AutoTrim watches that estimate while the pilot holds no movement keys and walks a stick offset
+(trim) against the drift until it stops, like tapping the app's trim buttons for you. Each time
+the pilot lets go (and right after take off) it first calibrates: a few seconds of faster
+correction, then it drops back to a slow hold.
 
 Limits: a sideways slide from a forward camera can also be the drone turning (yaw), and a scene
 with no texture (blank wall, sky) gives no estimate – the HUD then shows "low texture".
@@ -33,6 +35,8 @@ TRIM_MAX_RATE = 4.0       # % stick per second, fastest the auto-trim may move
 DEADBAND = 0.006          # frame-widths/s treated as "not drifting"
 SETTLE = 0.7              # s with no movement keys before drift is believed (momentum dies out)
 AFTER_TAKEOFF = 2.0       # s after take off before auto-trim starts
+CALIBRATE_SECONDS = 3.0   # s of fast correction each time the pilot stops (and after take off)
+CALIBRATE_GAIN = 2.5      # gain and max rate are multiplied by this while calibrating
 
 
 class DriftEstimator:
@@ -91,9 +95,10 @@ class AutoTrim:
     def __init__(self, pilot, enabled=True):
         self.pilot = pilot
         self.enabled = enabled
-        self.state = "off"      # off | waiting | learning | steady | paused | low texture
+        self.state = "off"      # off | waiting | calibrating | learning | steady | paused | low texture
 
     def update(self, est, dt, airborne_for, idle_for):
+        """airborne_for: s since take off (None on the ground); idle_for: s since the last movement key."""
         if not self.enabled:
             self.state = "off"
         elif airborne_for is None or airborne_for < AFTER_TAKEOFF:
@@ -103,14 +108,18 @@ class AutoTrim:
         elif not est.valid:
             self.state = "low texture"
         else:
+            calibrating = (idle_for < SETTLE + CALIBRATE_SECONDS
+                           or airborne_for < AFTER_TAKEOFF + CALIBRATE_SECONDS)
+            boost = CALIBRATE_GAIN if calibrating else 1.0
             moving = False
             for axis in AXES:
                 v = est.vel[axis]
                 if abs(v) > DEADBAND:
-                    rate = max(-TRIM_MAX_RATE, min(TRIM_MAX_RATE, TRIM_GAIN * v))
+                    lim = TRIM_MAX_RATE * boost
+                    rate = max(-lim, min(lim, TRIM_GAIN * boost * v))
                     self.pilot.adjust_trim(axis, -rate * dt)
                     moving = True
-            self.state = "learning" if moving else "steady"
+            self.state = "calibrating" if calibrating else "learning" if moving else "steady"
 
 
 def describe(vel):

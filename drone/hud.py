@@ -18,10 +18,18 @@ RED = (70, 70, 240)
 
 ACTION_STYLE = {1: ("TAKING OFF", GREEN), 2: ("LANDING", YELLOW), 4: ("MOTORS OFF", RED),
                 0x80: ("CALIBRATING GYRO", YELLOW)}
-AUTO_STYLE = {"learning": ("CORRECTING", YELLOW), "steady": ("HOLDING", GREEN), "paused": ("PAUSED", GREY),
+AUTO_STYLE = {"calibrating": ("CALIBRATING", YELLOW), "learning": ("CORRECTING", YELLOW), "steady": ("HOLDING", GREEN), "paused": ("PAUSED", GREY),
               "waiting": ("AFTER TAKEOFF", GREY), "low texture": ("LOW TEXTURE", RED), "off": ("AUTO OFF", GREY)}
 DRIFT_FULL = 0.15         # frame-widths/s drawn as a full-length drift arrow
 PANEL_W = 180             # width of the right-hand panels
+
+
+def letterbox(shape):
+    """(x, y, width, height) of a frame of this shape on the canvas."""
+    h, w = shape[:2]
+    s = min(W / w, H / h)
+    nw, nh = int(w * s), int(h * s)
+    return (W - nw) // 2, (H - nh) // 2, nw, nh
 
 
 def fit(frame):
@@ -29,12 +37,46 @@ def fit(frame):
     canvas = np.zeros((H, W, 3), np.uint8)
     if frame is None:
         return canvas
-    h, w = frame.shape[:2]
-    s = min(W / w, H / h)
-    nw, nh = int(w * s), int(h * s)
-    x, y = (W - nw) // 2, (H - nh) // 2
+    x, y, nw, nh = letterbox(frame.shape)
     canvas[y:y + nh, x:x + nw] = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
     return canvas
+
+
+def to_frame(cx, cy, shape):
+    """Canvas pixel -> (u, v) fractions of the video frame, or None if outside the picture."""
+    x, y, nw, nh = letterbox(shape)
+    u, v = (cx - x) / nw, (cy - y) / nh
+    return (u, v) if 0 <= u < 1 and 0 <= v < 1 else None
+
+
+SPEED_BUTTONS = {s: (70 + (s - 1) * 40, 40, 70 + (s - 1) * 40 + 34, 70) for s in (1, 2, 3)}
+
+
+def speed_button_at(x, y):
+    """Which speed button (1-3) is at canvas pixel (x, y), or None."""
+    for s, (x0, y0, x1, y1) in SPEED_BUTTONS.items():
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            return s
+    return None
+
+
+def speed_buttons(img, speed):
+    panel(img, 12, 36, 70 + 3 * 40, 74)
+    text(img, "SPEED", (20, 60), GREY, 0.42)
+    for s, (x0, y0, x1, y1) in SPEED_BUTTONS.items():
+        keycap(img, x0, y0, x1 - x0, y1 - y0, str(s), s == speed)
+
+
+def goto_marker(img, st):
+    """Ring on the click-to-go target, with a line from the crosshair it's being flown to."""
+    x, y, nw, nh = letterbox(st["frame_shape"])
+    u, v = st["goto"]
+    p = (x + round(u * nw), y + round(v * nh))
+    cv2.line(img, (W // 2, H // 2), p, ACCENT, 1, cv2.LINE_AA)
+    r = 14 + round(3 * np.sin(st["t"] * 6))
+    cv2.circle(img, p, r, ACCENT, 2, cv2.LINE_AA)
+    cv2.circle(img, p, 3, ACCENT, -1, cv2.LINE_AA)
+    text(img, "GO TO", (p[0], p[1] - r - 6), ACCENT, 0.45, 1, "c")
 
 
 def panel(img, x0, y0, x1, y1, alpha=0.6):
@@ -133,7 +175,7 @@ def keys_panel(img, st):
         text(img, "H  show controls", (22, H - 21), GREY, 0.45)
         return
     k, g = 38, 5
-    rows_h = (2 * k + g + 24 + 36 + 32) if st["fly"] else 0
+    rows_h = (2 * k + g + 24 + 36 + 32 + 20) if st["fly"] else 0
     x0, y0 = 12, H - 12 - (rows_h + 50)
     panel(img, x0, y0, x0 + 356, H - 12)
     x, y = x0 + 12, y0 + 12
@@ -162,6 +204,8 @@ def keys_panel(img, st):
             keycap(img, cx, y, w, 26, name, key in p, cap)
             cx += w + 6
         y += 32
+        text(img, "CLICK video: fly there (same height)   R-CLICK: cancel", (x, y + 10), GREY, 0.4)
+        y += 20
     cx = x
     for key, name, cap, w in (("p", "P", "PHOTO", 72), ("v", "V", "REC", 58),
                               ("h", "H", "HIDE", 64), ("back", "BKSP", "TRIM 0", 90)):
@@ -251,7 +295,10 @@ def draw(img, st):
         text(img, f"CONNECTING TO DRONE{dots}", (W // 2 - 150, H // 2 - 40), WHITE, 0.8, 2)
         text(img, "join the drone's Wi-Fi if you haven't", (W // 2, H // 2 - 12), GREY, 0.5, 1, "c")
     top_bar(img, st)
+    if st["goto"]:
+        goto_marker(img, st)
     if st["fly"]:
+        speed_buttons(img, st["speed"])
         stick_panel(img, st["levels"], st["trim"])
         drift_panel(img, st)
         if not st["focused"]:

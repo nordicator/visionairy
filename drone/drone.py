@@ -10,10 +10,13 @@ Keys (in the video window) – hold a movement key to push harder, let go to sto
   T take off   L land   SPACE motors off   C gyro calibrate (on the ground)
   SHIFT + W/A/S/D/R/F nudge trim   K auto-trim on/off   BACKSPACE reset trim
   P photo   V start/stop recording   H hide key map   ESC quit
+  CLICK the video to fly there, same height (see target.py)   RIGHT-CLICK or a movement key cancels
+  SPEED 1/2/3: click the buttons in the window (no key)
 Photos and recordings go to the media/ folder next to this script.
 
 Drift: while no movement keys are held the video is used to measure which way the drone is
-sliding, and auto-trim slowly offsets the sticks to cancel it (see drift.py). Trims are saved
+sliding, and auto-trim offsets the sticks to cancel it (see drift.py). Every time you let go it
+auto-calibrates for a few seconds with faster correction, then holds. Trims are saved
 to trim.json and reused next time.
 
 Needs: pip install opencv-python numpy
@@ -31,14 +34,15 @@ from collections import deque
 
 from protocol import (A_CONTROL_OFF, A_HEARTBEAT, A_IP, A_CTRL_PORT, A_RTSP, B_CMD_CONTROL_OFF,
                       B_CMD_START, B_HELLO, B_IP, B_PORT, BReceiver, CENTER, FLAG_GYRO_CAL, FLAG_LAND,
-                      FLAG_STOP, FLAG_TAKEOFF, Sticks, T_ACK, T_CTLMSG, T_FRAG, a_control_packet,
-                      a_parse_status, b_ctlmsg_reply, b_parse, control_frame)
+                      FLAG_STOP, FLAG_TAKEOFF, SPEED_RANGES, Sticks, T_ACK, T_CTLMSG, T_FRAG,
+                      a_control_packet, a_parse_status, b_ctlmsg_reply, b_parse, control_frame)
 
 try:
     import cv2
     import numpy as np
     import drift
     import hud
+    import target
 except ImportError:
     cv2 = None
 
@@ -134,10 +138,17 @@ class Pilot:
         self.lock = threading.Lock()
         self.level = dict.fromkeys(AXES, 0.0)   # -100..100 % of stick range
         self.trim = dict.fromkeys(AXES, 0.0)    # % offset added to every stick, cancels drift
+        self.speed = 1                          # app speed mode 1-3: right-stick range (SPEED_RANGES)
+        self.steering = False                   # click-to-go is driving: ignore the speed mode
         self._pulses = {}                       # flag -> expires
+
+    def set_speed(self, speed):
+        with self.lock:
+            self.speed = speed
 
     def update(self, held, dt):
         with self.lock:
+            self.steering = False
             for axis, d in held.items():
                 v = self.level[axis]
                 if d == 0:
@@ -147,6 +158,12 @@ class Pilot:
                 else:
                     v = d * min(100.0, abs(v) + RAMP_RATE * dt)
                 self.level[axis] = v
+
+    def steer(self, levels):
+        """Set the sticks directly (click-to-go), -100..100 % per axis of the full stick range."""
+        with self.lock:
+            self.steering = True
+            self.level.update(levels)
 
     def levels(self):
         with self.lock:
@@ -182,8 +199,11 @@ class Pilot:
         s = Sticks()                            # throttle 128 = hold altitude
         with self.lock:
             for axis, name in AXES.items():
-                v = max(-100.0, min(100.0, self.level[axis] + self.trim[axis]))
-                setattr(s, name, CENTER + round(v / 100 * 127))
+                # like the app, the speed mode only limits the right stick (roll/pitch) the pilot
+                # moves; trim and the throttle stay on the full range
+                reach = 127 if axis == "z" or self.steering else SPEED_RANGES[self.speed]
+                v = self.level[axis] * reach / 127 + self.trim[axis]
+                setattr(s, name, CENTER + round(max(-100.0, min(100.0, v)) / 100 * 127))
         s.flags = self.action()[0]
         return s
 
@@ -362,6 +382,12 @@ class Link:
         self.pilot.set_trims(drift.load_trim(TRIM_FILE))
         saved_trim = self.pilot.trims()
         last_input = last_drift_log = 0.0
+        goto = target.ClickTarget(self.camera)
+        clicks = []                     # (button, canvas x, canvas y) from the mouse callback
+
+        def on_mouse(event, x, y, flags, param):
+            if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
+                clicks.append((event, x, y))
 
         def toast(msg):
             toasts.append((msg, time.time() + 2.5))
@@ -372,6 +398,8 @@ class Link:
             return time.strftime("%Y%m%d_%H%M%S")
 
         cv2.namedWindow(WINDOW)
+        cv2.setMouseCallback(WINDOW, on_mouse)
+        focused = False
         while self.running:
             now = time.time()
             if self.frames != shown and self.latest_jpeg:
@@ -383,9 +411,11 @@ class Link:
                 if decoded is not None:
                     img = decoded
                     est.update(img, now)
+                    goto.update(img, now)
                     if writer:
                         writer.write(img if img.shape[1::-1] == rec_size else cv2.resize(img, rec_size))
 
+            was_focused = focused
             pressed, focused = kb.poll()
             held = axes_from(pressed)
             if any(held.values()) or "shift" in pressed:
@@ -393,11 +423,56 @@ class Link:
             age = now - frame_times[-1] if frame_times else None
             if age is None or age > 0.5:
                 est.valid = False
+            airborne = None if flight_start is None else now - flight_start
+            for button, cx, cy in clicks:
+                if not self.fly:
+                    continue
+                speed = hud.speed_button_at(cx, cy)
+                if speed:                               # speed is set only with these buttons
+                    if button == cv2.EVENT_LBUTTONDOWN and speed != self.pilot.speed:
+                        self.pilot.set_speed(speed)
+                        toast(f"speed {speed}")
+                    continue
+                if not was_focused:                     # the click that focuses the window
+                    continue
+                if button == cv2.EVENT_RBUTTONDOWN:
+                    if goto.active:
+                        goto.cancel()
+                        toast("go-to cancelled")
+                elif img is None:
+                    toast("no video yet")
+                elif airborne is None:
+                    toast("take off first, then click")
+                else:
+                    spot = hud.to_frame(cx, cy, img.shape)
+                    if spot:
+                        goto.set(*spot, now)
+                        toast("flying to target")
+            clicks.clear()
             if self.fly:
-                self.pilot.update(held, now - last_t)
-                airborne = None if flight_start is None else now - flight_start
+                going = goto.state
+                if goto.active and (any(held.values()) or airborne is None):
+                    goto.cancel()
+                    toast("go-to cancelled")
+                elif goto.active and age is not None and age > 1.5:
+                    goto.cancel("lost")
+                if goto.active:
+                    self.pilot.steer(goto.command(now, age is not None and age < 0.5))
+                    last_input = now                    # auto-trim waits, then recalibrates
+                else:
+                    self.pilot.update(held, now - last_t)
+                if going == "tracking" and goto.state in ("arrived", "lost", "timeout"):
+                    self.pilot.steer(dict.fromkeys(AXES, 0.0))
+                    toast({"arrived": "target reached", "lost": "lost the target – stopped",
+                           "timeout": "couldn't reach target – stopped"}[goto.state])
+                was = auto.state
                 auto.update(est, now - last_t, airborne, now - last_input)
-                if auto.state == "learning" and now - last_drift_log > 3.0:
+                if auto.state == "calibrating" and was != "calibrating":
+                    toast("stopped – calibrating drift")
+                elif was == "calibrating" and auto.state in ("learning", "steady"):
+                    t = self.pilot.trims()
+                    toast(f"calibrated  trim X {t['x']:+.0f}  Y {t['y']:+.0f}  Z {t['z']:+.0f}")
+                if auto.state in ("calibrating", "learning") and now - last_drift_log > 3.0:
                     last_drift_log = now
                     t = self.pilot.trims()
                     self.log(f"drift {drift.describe(est.vel)} "
@@ -429,6 +504,8 @@ class Link:
                 "pressed": pressed, "focused": focused, "show_keys": show_keys,
                 "trim": trims, "drift": dict(est.vel), "drift_valid": est.valid,
                 "drift_text": drift.describe(est.vel), "auto": auto.state,
+                "goto": goto.norm() if goto.active and img is not None else None,
+                "frame_shape": None if img is None else img.shape, "speed": self.pilot.speed,
                 "toasts": [m for m, _ in reversed(toasts)],
             }
             canvas = hud.fit(img)
