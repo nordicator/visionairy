@@ -47,7 +47,7 @@ const MIME = {
   '.svg': 'image/svg+xml',
 };
 
-const ROUTES = { '/': 'index.html', '/headset': 'headset.html', '/graph': 'graph.html' };
+const ROUTES = { '/': 'index.html', '/headset': 'headset.html', '/graph': 'graph.html', '/sims': 'sims.html' };
 
 const server = https.createServer(loadCert(), (req, res) => {
   const url = new URL(req.url, 'https://x');

@@ -1,0 +1,817 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Drone Test Lab</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    :root { --cy: #34d6ff; --yl: #ffd23f; --rd: #ff4a4a; --am: #ffab2e; --ok: #39ff6a; --panel: rgba(0, 10, 6, 0.82); --line: rgba(57, 255, 106, 0.28); }
+    html, body { overflow: hidden; }
+    body { background: #000; }
+    #view { position: fixed; inset: 0; }
+    .panel { position: fixed; background: var(--panel); border: 1px solid var(--line); padding: 10px 12px; font-size: 12px; line-height: 1.45; backdrop-filter: blur(3px); z-index: 3; }
+    .panel h3 { margin: 8px 0 4px; font-size: 10px; letter-spacing: 0.25em; color: var(--hud-dim); font-weight: normal; border-top: 1px solid var(--line); padding-top: 6px; }
+    .panel h3:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+    .row { display: flex; justify-content: space-between; gap: 10px; white-space: nowrap; }
+    .row > span:first-child { color: var(--hud-dim); }
+    .ok { color: var(--ok); } .warn { color: var(--am); } .bad { color: var(--rd); } .cy { color: var(--cy); } .yl { color: var(--yl); } .dim { color: var(--hud-dim); }
+
+    #head { top: 12px; left: 12px; width: 360px; }
+    #brand { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; letter-spacing: 0.16em; white-space: nowrap; }
+    #brand b { color: #fff; font-weight: normal; }
+    #simtag { font-size: 9px; letter-spacing: 0.15em; color: #000; background: var(--am); padding: 1px 5px; }
+    #pick { display: flex; gap: 6px; margin: 8px 0; }
+    #pick select { flex: 1; padding: 4px 6px; font-size: 12px; }
+    #pick button, #ctrl button { padding: 3px 9px; font-size: 12px; border-width: 1px; letter-spacing: 0.05em; cursor: pointer; }
+    #pick button:hover, #ctrl button:hover { background: rgba(57, 255, 106, 0.15); }
+    #title { font-size: 17px; color: #fff; margin: 2px 0; }
+    #title .id { color: var(--hud); margin-right: 8px; }
+    #tags { display: flex; gap: 6px; align-items: center; margin: 4px 0 6px; }
+    .tag { font-size: 10px; letter-spacing: 0.15em; border: 1px solid currentColor; padding: 0 6px; }
+    #verdict { font-size: 11px; letter-spacing: 0.12em; padding: 1px 8px; color: #000; }
+    #verdict.ok { background: var(--ok); } #verdict.warn { background: var(--am); } #verdict.bad { background: var(--rd); color: #fff; }
+    #desc { color: #c9f5d4; font-size: 12px; }
+    #lesson { margin-top: 6px; padding: 5px 7px; border-left: 3px solid var(--rd); background: rgba(255, 74, 74, 0.08); color: #ffd0d0; font-size: 11.5px; display: none; }
+    #lesson b { color: var(--rd); font-weight: normal; letter-spacing: 0.15em; font-size: 10px; display: block; }
+
+    #tele { top: 12px; left: 12px; width: 360px; }
+    #tele .big { font-size: 15px; color: #fff; }
+    .bar { position: relative; height: 7px; background: rgba(57, 255, 106, 0.12); margin-top: 3px; }
+    .bar i { position: absolute; top: 0; bottom: 0; left: 0; background: var(--ok); }
+    #bat .bar i { transition: none; }
+
+    #right { top: 12px; right: 12px; width: 240px; }
+    #att { display: block; width: 216px; height: 150px; margin: 2px auto 4px; }
+    .stk { display: grid; grid-template-columns: 52px 1fr 40px; align-items: center; gap: 6px; margin: 2px 0; }
+    .stk .track { position: relative; height: 9px; background: rgba(57, 255, 106, 0.1); }
+    .stk .track::after { content: ''; position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--hud-dim); }
+    .stk .track i { position: absolute; top: 0; bottom: 0; background: var(--cy); }
+    .stk span:last-child { text-align: right; color: #fff; }
+    #motors { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; height: 76px; margin-top: 4px; }
+    .mot { display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 10px; }
+    .mot .col { flex: 1; width: 16px; background: rgba(57, 255, 106, 0.1); position: relative; }
+    .mot .col i { position: absolute; left: 0; right: 0; bottom: 0; background: var(--ok); }
+    .mot.dead .col { outline: 1px solid var(--rd); }
+    #warns { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; min-height: 20px; }
+    .chip { font-size: 11px; letter-spacing: 0.1em; padding: 3px 7px; border: 1px solid currentColor; }
+    .chip.blink { animation: blink 0.5s steps(2) infinite; }
+    @keyframes blink { 50% { opacity: 0.25; } }
+
+    #banner { position: fixed; top: 18%; left: 50%; transform: translateX(-50%); font-size: 34px; letter-spacing: 0.25em; padding: 10px 28px; border: 2px solid currentColor; background: rgba(0, 0, 0, 0.7); display: none; text-align: center; pointer-events: none; z-index: 4; }
+    #banner small { display: block; font-size: 13px; letter-spacing: 0.12em; margin-top: 4px; opacity: 0.85; }
+
+    #bottom { left: 12px; right: 12px; bottom: 12px; display: grid; grid-template-columns: 1fr 380px; gap: 12px; padding: 10px 12px 8px; }
+    #chartbox { position: relative; }
+    #chart { display: block; width: 100%; height: 86px; }
+    #legend { position: absolute; top: 0; right: 4px; font-size: 10px; display: flex; gap: 12px; }
+    #tl { position: relative; height: 22px; margin-top: 6px; }
+    #seek { width: 100%; margin: 0; position: absolute; top: 4px; }
+    .tick { position: absolute; top: 0; width: 3px; height: 8px; margin-left: -1px; cursor: pointer; }
+    #ctrl { display: flex; gap: 6px; align-items: center; margin-top: 4px; font-size: 12px; }
+    #ctrl .time { margin-left: auto; color: #fff; }
+    #ctrl button.on { background: var(--hud); color: #000; }
+    #log { font-size: 11px; line-height: 1.45; height: 124px; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
+    #log div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+    #log div span { color: var(--hud-dim); margin-right: 6px; }
+    #log div.fresh { background: rgba(57, 255, 106, 0.12); }
+    #log div.info { color: #b9e8c6; }
+
+    #batchp { top: 12px; right: 12px; width: 300px; display: none; }
+    #hist { display: block; width: 276px; height: 120px; margin-top: 4px; }
+    #fails { max-height: 210px; overflow: hidden; font-size: 11px; }
+
+    #matrix { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.88); display: none; align-items: center; justify-content: center; z-index: 5; }
+    #matrix .box { width: min(1100px, 94vw); max-height: 90vh; overflow: auto; border: 1px solid var(--hud); padding: 18px 22px; background: #010a04; }
+    #matrix h2 { margin: 0 0 4px; letter-spacing: 0.3em; font-size: 18px; }
+    #matrix table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+    #matrix th { text-align: left; font-weight: normal; color: var(--hud-dim); font-size: 10px; letter-spacing: 0.2em; border-bottom: 1px solid var(--line); padding: 4px 6px; }
+    #matrix td { padding: 6px; border-bottom: 1px solid rgba(57, 255, 106, 0.1); }
+    #matrix tr.r { cursor: pointer; } #matrix tr.r:hover { background: rgba(57, 255, 106, 0.08); }
+    #stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 12px; }
+    #stats div { border: 1px solid var(--line); padding: 8px 10px; }
+    #stats b { display: block; font-size: 24px; color: #fff; font-weight: normal; }
+    #stats span { font-size: 10px; letter-spacing: 0.15em; color: var(--hud-dim); }
+    #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 16px; letter-spacing: 0.3em; z-index: 9; background: #000; }
+    .lbl { font: 11px ui-monospace, Menlo, monospace; color: #fff; text-shadow: 0 0 4px #000, 0 0 2px #000; white-space: nowrap; letter-spacing: 0.1em; }
+    .lbl.drone { color: var(--cy); }
+    .lbl.ob { color: #ffb0b0; }
+    #keys { font-size: 10px; color: var(--hud-dim); margin-top: 6px; }
+  </style>
+  <script type="importmap">
+    { "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    } }
+  </script>
+</head>
+<body>
+  <div id="loading">SIMULATING TEST FLIGHTS…</div>
+  <div id="view"></div>
+
+  <div id="head" class="panel">
+    <div id="brand"><span>VISION<b>AIRY</b> · DRONE TEST LAB</span><span id="simtag">SIMULATION</span></div>
+    <div id="pick"><button id="prev" title="Previous ( [ )">◀</button><select id="sel"></select><button id="next" title="Next ( ] )">▶</button><button id="mbtn" title="Test matrix (M)">ALL</button></div>
+    <div id="title"></div>
+    <div id="tags"><span id="cat" class="tag"></span><span id="verdict"></span></div>
+    <div id="desc"></div>
+    <div id="lesson"><b>FINDING</b><span></span></div>
+  </div>
+
+  <div id="tele" class="panel">
+    <h3>TELEMETRY</h3>
+    <div class="row"><span>T+</span><span id="t_t" class="big"></span></div>
+    <div class="row"><span>MODE</span><span id="t_mode" class="big"></span></div>
+    <div class="row"><span>POSITION</span><span id="t_pos"></span></div>
+    <div class="row"><span>ALTITUDE</span><span id="t_alt"></span></div>
+    <div class="row"><span>SPEED</span><span id="t_spd"></span></div>
+    <div class="row"><span>HEADING</span><span id="t_hdg"></span></div>
+    <h3>TRACKING</h3>
+    <div class="row"><span>PATH ERROR</span><span id="t_err" class="big"></span></div>
+    <div class="row"><span>MEAN / MAX</span><span id="t_errs"></span></div>
+    <div class="row"><span>DRONE FIX</span><span id="t_fix"></span></div>
+    <h3>SYSTEMS</h3>
+    <div class="row"><span>LINK</span><span id="t_link"></span></div>
+    <div id="bat"><div class="row"><span>BATTERY</span><span id="t_bat"></span></div><div class="bar"><i id="t_batbar"></i></div></div>
+    <div class="row" style="margin-top:4px"><span>WIND</span><span id="t_wind"></span></div>
+  </div>
+
+  <div id="right" class="panel">
+    <h3>ATTITUDE</h3>
+    <canvas id="att" width="432" height="300"></canvas>
+    <div class="row"><span>ROLL / PITCH</span><span id="t_rp"></span></div>
+    <h3>STICKS (%)</h3>
+    <div class="stk"><span class="dim">ROLL</span><div class="track"><i id="s_r"></i></div><span id="v_r"></span></div>
+    <div class="stk"><span class="dim">PITCH</span><div class="track"><i id="s_p"></i></div><span id="v_p"></span></div>
+    <div class="stk"><span class="dim">THROT</span><div class="track"><i id="s_t"></i></div><span id="v_t"></span></div>
+    <h3>MOTORS</h3>
+    <div id="motors"></div>
+    <h3>ALERTS</h3>
+    <div id="warns"></div>
+  </div>
+
+  <div id="batchp" class="panel">
+    <h3>BATCH RESULTS</h3>
+    <div class="row"><span>RUNS</span><span id="b_runs" class="big"></span></div>
+    <div class="row"><span>PASSED</span><span id="b_pass" class="ok"></span></div>
+    <div class="row"><span>FAILED (off path)</span><span id="b_fail" class="bad"></span></div>
+    <div class="row"><span>MEDIAN MEAN ERROR</span><span id="b_med"></span></div>
+    <div class="row"><span>WORST RUN</span><span id="b_worst"></span></div>
+    <div class="row"><span>SIM FLIGHT TIME</span><span id="b_time"></span></div>
+    <h3>MEAN PATH ERROR · HISTOGRAM</h3>
+    <canvas id="hist" width="552" height="240"></canvas>
+    <h3>FAILED RUNS</h3>
+    <div id="fails"></div>
+  </div>
+
+  <div id="banner"></div>
+
+  <div id="bottom" class="panel">
+    <div>
+      <div id="chartbox"><canvas id="chart"></canvas><div id="legend"></div></div>
+      <div id="tl"><input id="seek" type="range" min="0" max="1" step="0.001" value="0" /></div>
+      <div id="ctrl">
+        <button id="restart" title="Restart (R)">⟲</button>
+        <button id="play" title="Play / pause (Space)">❚❚</button>
+        <button data-sp="0.5">0.5×</button><button data-sp="1" class="on">1×</button><button data-sp="2">2×</button><button data-sp="4">4×</button>
+        <button id="follow" class="on" title="Camera follows the drone (F)">FOLLOW CAM</button>
+        <button id="auto" title="Play every test in a loop (A)">AUTOPLAY</button>
+        <span class="time" id="clock"></span>
+      </div>
+    </div>
+    <div>
+      <div id="log"></div>
+      <div id="keys">SPACE play · ←/→ seek · [ ] test · M matrix · F follow · A autoplay · drag to orbit</div>
+    </div>
+  </div>
+
+  <div id="matrix"><div class="box">
+    <div class="row"><h2>TEST MATRIX</h2><button id="mclose" style="padding:3px 10px;font-size:12px;border-width:1px">CLOSE ✕</button></div>
+    <div class="dim" style="font-size:12px">Scripted simulations of the follow pipeline. Controller constants (gains, speed, lag limit, probe, 3 s lost-fix failsafe) are the ones in drone/follow.py. Click a row to replay it.</div>
+    <div id="stats"></div>
+    <table><thead><tr><th>ID</th><th>TEST</th><th>CATEGORY</th><th>DURATION</th><th>MEAN ERR</th><th>MAX ERR</th><th>IMPACT</th><th>RESULT</th></tr></thead><tbody id="mrows"></tbody></table>
+  </div></div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+    import { SCENARIOS, BATCH, run, runBatch, qrot, nlerp, K } from './sims-engine.js';
+
+    THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
+    const $ = (id) => document.getElementById(id);
+    const FDT = K.DT * K.REC;
+    const COL = { cy: 0x34d6ff, yl: 0xffd23f, rd: 0xff4a4a, am: 0xffab2e, ok: 0x39ff6a };
+
+    // --- renderer + scene -----------------------------------------------------
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x020604);
+    scene.fog = new THREE.Fog(0x020604, 9, 22);
+    const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.02, 100);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(2, devicePixelRatio));
+    $('view').appendChild(renderer.domElement);
+    const labels = new CSS2DRenderer();
+    labels.domElement.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:1';
+    document.body.appendChild(labels.domElement);
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    function resize() { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); labels.setSize(innerWidth, innerHeight); }
+    addEventListener('resize', resize); resize();
+
+    scene.add(new THREE.HemisphereLight(0xcfe8ff, 0x0a1a0e, 1.1));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.4); sun.position.set(3, -4, 6); scene.add(sun);
+
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(14, 14), new THREE.MeshStandardMaterial({ color: 0x06100a, roughness: 1 }));
+    floor.position.z = -0.002; scene.add(floor);
+    const grid = new THREE.GridHelper(14, 28, 0x1c7a35, 0x0d3318); grid.rotation.x = Math.PI / 2; scene.add(grid);
+    const fine = new THREE.GridHelper(4, 40, 0x0b2a14, 0x0b2a14); fine.rotation.x = Math.PI / 2; fine.position.z = 0.001; scene.add(fine);
+    for (const [d, c] of [[[1, 0, 0], 0xff5555], [[0, 1, 0], 0x55ff77], [[0, 0, 1], 0x5599ff]]) {
+      scene.add(new THREE.ArrowHelper(new THREE.Vector3(...d), new THREE.Vector3(0, 0, 0.002), 0.35, c, 0.07, 0.04));
+    }
+
+    // --- drone model (front = +Y, green LEDs) ---------------------------------
+    function makeDrone(scale = 1, color = 0x22282c) {
+      const g = new THREE.Group();
+      const dark = new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.3 });
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.13, 0.035), dark); g.add(body);
+      const top = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.09, 0.02), new THREE.MeshStandardMaterial({ color: 0x34d6ff, emissive: 0x0a3a48, roughness: 0.3 }));
+      top.position.z = 0.025; g.add(top);
+      const props = [];
+      const P = [[-1, 1], [1, 1], [1, -1], [-1, -1]]; // FL FR RR RL
+      for (const [sx, sy] of P) {
+        const arm = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.016, 0.012), dark);
+        arm.position.set(sx * 0.053, sy * 0.053, 0); arm.rotation.z = Math.atan2(sy, sx); g.add(arm);
+        const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.014, 0.03, 12), dark);
+        hub.rotation.x = Math.PI / 2; hub.position.set(sx * 0.106, sy * 0.106, 0.008); g.add(hub);
+        const disc = new THREE.Mesh(new THREE.CircleGeometry(0.064, 28), new THREE.MeshBasicMaterial({ color: 0xbfe9ff, transparent: true, opacity: 0.16, side: THREE.DoubleSide, depthWrite: false }));
+        disc.position.set(sx * 0.106, sy * 0.106, 0.025); g.add(disc);
+        const ring = new THREE.Mesh(new THREE.TorusGeometry(0.068, 0.004, 6, 32), new THREE.MeshStandardMaterial({ color: 0x3a444a }));
+        ring.position.copy(disc.position); g.add(ring);
+        const blade = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.012, 0.003), new THREE.MeshStandardMaterial({ color: 0xdddddd }));
+        blade.position.copy(disc.position); g.add(blade);
+        const led = new THREE.Mesh(new THREE.SphereGeometry(0.008, 8, 8), new THREE.MeshBasicMaterial({ color: sy > 0 ? 0x39ff6a : 0xff3030 }));
+        led.position.set(sx * 0.106, sy * 0.106, -0.01); g.add(led);
+        props.push({ blade, disc });
+      }
+      g.scale.setScalar(scale);
+      return { g, props, body: dark };
+    }
+
+    const drone = makeDrone();
+    scene.add(drone.g);
+    const droneLbl = new CSS2DObject(Object.assign(document.createElement('div'), { className: 'lbl drone' }));
+    droneLbl.position.set(0, 0, 0.16); drone.g.add(droneLbl);
+    const shadow = new THREE.Mesh(new THREE.CircleGeometry(0.17, 32), new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.5, depthWrite: false }));
+    shadow.position.z = 0.003; scene.add(shadow);
+    const dropLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineDashedMaterial({ color: 0x34d6ff, dashSize: 0.04, gapSize: 0.04, transparent: true, opacity: 0.5 }));
+    scene.add(dropLine);
+    const goalMk = new THREE.Mesh(new THREE.TorusGeometry(0.05, 0.006, 8, 32), new THREE.MeshBasicMaterial({ color: 0xff4fd8 }));
+    scene.add(goalMk);
+    const estMk = new THREE.Mesh(new THREE.SphereGeometry(0.035, 12, 12), new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.6 }));
+    scene.add(estMk);
+    const lostLbl = new CSS2DObject(Object.assign(document.createElement('div'), { className: 'lbl', style: 'color:#ffab2e' }));
+    estMk.add(lostLbl); lostLbl.position.set(0, 0, 0.09);
+
+    // Per-scenario objects live here and are thrown away on switch
+    let world = new THREE.Group(); scene.add(world);
+    function clearWorld() {
+      world.traverse((o) => { if (o.element) o.element.remove(); if (o.geometry !== markerGeo) o.geometry?.dispose?.(); });
+      scene.remove(world); world = new THREE.Group(); scene.add(world);
+    }
+    const V = (p) => new THREE.Vector3(p[0], p[1], p[2]);
+    function label(text, pos, cls = 'lbl') {
+      const o = new CSS2DObject(Object.assign(document.createElement('div'), { className: cls, textContent: text }));
+      o.position.copy(pos); world.add(o); return o;
+    }
+    function dashed(points, color, opacity = 0.9) {
+      const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points.map(V)), new THREE.LineDashedMaterial({ color, dashSize: 0.06, gapSize: 0.04, transparent: true, opacity }));
+      l.computeLineDistances(); world.add(l); return l;
+    }
+    function solid(points, color, opacity = 1) {
+      const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints(points.map(V)), new THREE.LineBasicMaterial({ color, transparent: opacity < 1, opacity }));
+      world.add(l); return l;
+    }
+    function addObstacle(ob) {
+      const size = [0, 1, 2].map((i) => ob.max[i] - ob.min[i]), c = [0, 1, 2].map((i) => (ob.max[i] + ob.min[i]) / 2);
+      const color = ob.kind === 'wall' ? 0x7f8fa6 : 0xb5651d;
+      const m = new THREE.Mesh(new THREE.BoxGeometry(...size), new THREE.MeshStandardMaterial({ color, transparent: true, opacity: ob.kind === 'wall' ? 0.35 : 0.85, roughness: 0.8, depthWrite: ob.kind !== 'wall' }));
+      m.position.set(...c); world.add(m);
+      const e = new THREE.LineSegments(new THREE.EdgesGeometry(m.geometry), new THREE.LineBasicMaterial({ color: ob.kind === 'wall' ? 0xa9c1e0 : 0xffb070, transparent: true, opacity: 0.7 }));
+      e.position.copy(m.position); world.add(e);
+    }
+    function addPad(p) {
+      const pad = new THREE.Mesh(new THREE.RingGeometry(0.17, 0.2, 40), new THREE.MeshBasicMaterial({ color: 0x39ff6a, transparent: true, opacity: 0.6, side: THREE.DoubleSide }));
+      pad.position.set(p[0], p[1], 0.002); world.add(pad);
+      label('PAD', new THREE.Vector3(p[0], p[1] - 0.27, 0.01), 'lbl');
+    }
+
+    // Trail with per-point colour by flight state
+    function stateColor(f) {
+      if (f.crashed || f.eStop) return COL.rd;
+      if (f.motorFail >= 0) return 0xff4fd8;
+      if (!f.fixOK || /FAILSAFE|LOW BATT/.test(f.mode)) return COL.am;
+      return COL.cy;
+    }
+    function makeTrail(frames, colorFn) {
+      const n = frames.length, pos = new Float32Array(n * 3), col = new Float32Array(n * 3), c = new THREE.Color();
+      frames.forEach((f, i) => {
+        const p = f.p || f; pos.set([p[0], p[1], p[2]], i * 3);
+        c.setHex(colorFn(f)); col.set([c.r, c.g, c.b], i * 3);
+      });
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      g.setDrawRange(0, 0);
+      return new THREE.Line(g, new THREE.LineBasicMaterial({ vertexColors: true }));
+    }
+
+    // Sparks: deterministic burst so scrubbing replays it the same
+    function makeSparks(sp) {
+      const N = 90, v0 = [], r = mulberry(sp.seed);
+      for (let i = 0; i < N; i++) {
+        const th = r() * Math.PI * 2, ph = r() * Math.PI * 0.5, s = (0.6 + r() * 1.8) * (0.5 + Math.min(2, sp.imp) * 0.6);
+        v0.push([Math.cos(th) * Math.cos(ph) * s, Math.sin(th) * Math.cos(ph) * s, Math.sin(ph) * s + 0.4]);
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+      const pts = new THREE.Points(g, new THREE.PointsMaterial({ color: 0xffc04a, size: 0.035, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+      const ring = new THREE.Mesh(new THREE.RingGeometry(0.9, 1, 48), new THREE.MeshBasicMaterial({ color: 0xff4a4a, transparent: true, side: THREE.DoubleSide, depthWrite: false }));
+      ring.position.set(sp.p[0], sp.p[1], Math.max(0.005, sp.p[2]));
+      world.add(pts, ring);
+      return {
+        update(t) {
+          const a = t - sp.t, on = a >= 0 && a < 1.6;
+          pts.visible = on; ring.visible = on && a < 0.6;
+          if (!on) return;
+          const arr = g.attributes.position.array;
+          v0.forEach((v, i) => {
+            arr[i * 3] = sp.p[0] + v[0] * a; arr[i * 3 + 1] = sp.p[1] + v[1] * a;
+            arr[i * 3 + 2] = Math.max(0.01, sp.p[2] + v[2] * a - 4.9 * a * a);
+          });
+          g.attributes.position.needsUpdate = true;
+          pts.material.opacity = 1 - a / 1.6;
+          ring.scale.setScalar(0.05 + a * 0.9); ring.material.opacity = 0.8 * (1 - a / 0.6);
+        },
+      };
+    }
+    function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+    // --- data ------------------------------------------------------------------
+    let RES = [], BAT = null;
+    const TESTS = () => [...SCENARIOS.map((sc, i) => ({ sc, S: RES[i] })), { sc: BATCH, batch: true }];
+
+    // --- playback state --------------------------------------------------------
+    const st = { i: 0, t: 0, playing: true, speed: 1, follow: true, auto: false, endHold: 0 };
+    let cur = null; // { sc, S, trail, sparks[], beacon, batch... }
+
+    function load(i) {
+      const list = TESTS();
+      st.i = (i + list.length) % list.length; st.t = 0; st.endHold = 0; st.playing = true;
+      $('play').textContent = '❚❚';
+      $('sel').value = st.i;
+      clearWorld();
+      const item = list[st.i];
+      item.batch ? loadBatch(item) : loadOne(item);
+      fitCamera();
+      buildHeader();
+      buildTicks();
+      lastLogKey = '';
+    }
+
+    function loadOne({ sc, S }) {
+      const isBatch = false;
+      $('tele').style.display = $('right').style.display = '';
+      $('batchp').style.display = 'none';
+      drone.g.visible = shadow.visible = dropLine.visible = true;
+      for (const ob of S.obstacles) addObstacle(ob);
+      const seen = new Set();
+      for (const ob of S.obstacles) { if (seen.has(ob.label)) continue; seen.add(ob.label); label(ob.label, V([(ob.min[0] + ob.max[0]) / 2, (ob.min[1] + ob.max[1]) / 2, ob.max[2] + 0.1]), 'lbl ob'); }
+      addPad(S.home);
+      for (const r of sc.ref || []) dashed(r, COL.yl, 0.85);
+      let beacon = null;
+      if (sc.beacon) {
+        const arcLine = solid(sc.beacon.pts, 0xffa531, 0.9);
+        arcLine.geometry.setDrawRange(0, 0);
+        const ball = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 16), new THREE.MeshStandardMaterial({ color: COL.yl, emissive: 0x6a5200 }));
+        world.add(ball);
+        const lbl = label('BEACON', V(sc.beacon.pts[0]), 'lbl'); lbl.element.style.color = '#ffd23f';
+        const end = sc.beacon.pts[sc.beacon.pts.length - 1];
+        const x = new THREE.Mesh(new THREE.RingGeometry(0.05, 0.07, 24), new THREE.MeshBasicMaterial({ color: 0xffa531, side: THREE.DoubleSide }));
+        x.position.set(end[0], end[1], 0.004); world.add(x);
+        beacon = { arcLine, ball, lbl, b: sc.beacon };
+      }
+      const trail = makeTrail(S.frames, stateColor); world.add(trail);
+      cur = { sc, S, trail, beacon, sparks: S.sparks.map(makeSparks), dur: S.duration };
+    }
+
+    const markerGeo = new THREE.OctahedronGeometry(0.045);
+    const markerOk = new THREE.MeshBasicMaterial({ color: COL.cy }), markerBad = new THREE.MeshBasicMaterial({ color: COL.rd });
+    function loadBatch(item) {
+      if (!BAT) BAT = runBatch();
+      $('tele').style.display = $('right').style.display = 'none';
+      $('batchp').style.display = '';
+      drone.g.visible = shadow.visible = dropLine.visible = false;
+      goalMk.visible = estMk.visible = false;
+      const runs = BAT.map((b) => {
+        const fail = !b.verdict.ok;
+        solid(b.sc.arc.path, fail ? 0xff7a7a : COL.yl, fail ? 0.5 : 0.18);
+        const trail = makeTrail(b.S.frames, () => (fail ? COL.rd : COL.cy));
+        trail.material.transparent = true; trail.material.opacity = fail ? 0.95 : 0.55;
+        world.add(trail);
+        const d = new THREE.Mesh(markerGeo, fail ? markerBad : markerOk); world.add(d);
+        return { b, trail, d };
+      });
+      addPad([0, 0, 0]);
+      const dur = Math.max(...BAT.map((b) => b.S.duration));
+      cur = { sc: item.sc, batch: true, runs, dur, sparks: [] };
+      buildBatchPanel();
+    }
+
+    function fitCamera() {
+      let pts = [];
+      if (cur.batch) pts = cur.runs.flatMap((r) => r.b.sc.arc.path);
+      else pts = [...(cur.sc.ref || []).flat(), cur.S.home, ...cur.S.frames.filter((_, i) => i % 10 === 0).map((f) => f.p)];
+      const bb = new THREE.Box3().setFromPoints(pts.map(V));
+      const c = bb.getCenter(new THREE.Vector3()), size = bb.getSize(new THREE.Vector3()).length();
+      c.z = Math.max(0.5, c.z * 0.8);
+      const d = Math.max(3.2, size * (cur.batch ? 1.1 : 1.35));
+      controls.target.copy(c);
+      camera.position.set(c.x + d * 0.55, c.y - d * 0.75, c.z + d * 0.55);
+      st.follow = !cur.batch && $('follow').classList.contains('on');
+    }
+
+    // --- header / matrix -------------------------------------------------------
+    const CATCLS = { NOMINAL: 'ok', MANEUVER: 'cy', ROBUSTNESS: 'yl', FAILSAFE: 'warn', CRASH: 'bad', BATCH: 'cy' };
+    function buildHeader() {
+      const { sc } = cur;
+      $('title').innerHTML = `<span class="id">${sc.id}</span>${sc.name}`;
+      $('cat').textContent = sc.cat; $('cat').className = 'tag ' + CATCLS[sc.cat];
+      let v;
+      if (cur.batch) { const ok = BAT.filter((b) => b.verdict.ok).length; v = { txt: `${ok}/${BAT.length} PASS`, cls: ok === BAT.length ? 'ok' : 'warn' }; }
+      else v = cur.S.verdict;
+      $('verdict').textContent = v.txt; $('verdict').className = v.cls;
+      $('desc').textContent = sc.desc;
+      $('lesson').style.display = sc.lesson ? 'block' : 'none';
+      $('lesson').querySelector('span').textContent = sc.lesson || '';
+      // Telemetry sits below the header
+      requestAnimationFrame(() => {
+        const h = $('head').getBoundingClientRect().bottom + 10;
+        $('tele').style.top = h + 'px';
+      });
+    }
+
+    function buildMatrix() {
+      const rows = TESTS().map((it, i) => {
+        if (it.batch) {
+          const ok = BAT.filter((b) => b.verdict.ok).length, means = BAT.map((b) => b.mean).sort((a, b) => a - b);
+          return `<tr class="r" data-i="${i}"><td class="cy">${it.sc.id}</td><td>${it.sc.name}</td><td class="cy">BATCH</td><td>${BAT.length} runs</td><td>${cm(means[means.length >> 1])} <span class="dim">median</span></td><td>${cm(Math.max(...BAT.map((b) => b.max)))}</td><td>--</td><td class="${ok === BAT.length ? 'ok' : 'warn'}">${ok}/${BAT.length} PASS</td></tr>`;
+        }
+        const { sc, S } = it;
+        return `<tr class="r" data-i="${i}"><td class="ok">${sc.id}</td><td>${sc.name}</td><td class="${CATCLS[sc.cat]}">${sc.cat}</td><td>${S.duration.toFixed(1)} s</td><td>${cm(S.errMeanFinal)}</td><td>${cm(S.errMaxFinal)}</td><td>${S.impact ? S.impact.toFixed(2) + ' m/s' : '--'}</td><td class="${S.verdict.cls}">${S.verdict.txt}</td></tr>`;
+      });
+      $('mrows').innerHTML = rows.join('');
+      $('mrows').querySelectorAll('tr').forEach((tr) => tr.onclick = () => { load(+tr.dataset.i); showMatrix(false); });
+      const flights = RES.length + BAT.length;
+      const simTime = RES.reduce((a, S) => a + S.duration, 0) + BAT.reduce((a, b) => a + b.S.duration, 0);
+      const crashes = RES.filter((S) => S.crashed).length;
+      const passed = RES.filter((S) => S.verdict.ok).length + BAT.filter((b) => b.verdict.ok).length;
+      const scenarioTypes = SCENARIOS.length + 1;
+      $('stats').innerHTML = [
+        [scenarioTypes, 'SCENARIOS'], [flights, 'SIMULATED FLIGHTS'], [(simTime / 60).toFixed(1) + ' min', 'SIM FLIGHT TIME'],
+        [crashes, 'CRASH CASES STUDIED'], [`${passed}/${flights}`, 'PASSED'],
+      ].map(([b, s]) => `<div><b>${b}</b><span>${s}</span></div>`).join('');
+    }
+    function showMatrix(on) { $('matrix').style.display = on ? 'flex' : 'none'; }
+    const cm = (m) => (m == null ? '--' : (m * 100).toFixed(1) + ' cm');
+
+    function buildBatchPanel() {
+      const ok = BAT.filter((b) => b.verdict.ok), bad = BAT.filter((b) => !b.verdict.ok);
+      const means = BAT.map((b) => b.mean).sort((a, b) => a - b), worst = BAT.reduce((a, b) => (b.mean > a.mean ? b : a));
+      $('b_runs').textContent = BAT.length;
+      $('b_pass').textContent = `${ok.length}  (${(ok.length / BAT.length * 100).toFixed(0)} %)`;
+      $('b_fail').textContent = bad.length;
+      $('b_med').textContent = cm(means[means.length >> 1]);
+      $('b_worst').textContent = `${worst.sc.id} · ${cm(worst.mean)}`;
+      $('b_time').textContent = (BAT.reduce((a, b) => a + b.S.duration, 0) / 60).toFixed(1) + ' min';
+      $('fails').innerHTML = bad.map((b) => `<div class="row"><span class="bad">${b.sc.id}</span><span>${cm(b.mean)} / ${cm(b.max)}</span><span class="warn">gust ${b.gustAmp.toFixed(2)}</span></div>`).join('') +
+        '<div class="dim" style="margin-top:4px;white-space:normal">Every failure had a side gust above 1.1 m/s². The PD loop has no integral term, so strong steady pushes leave it off path.</div>';
+      // histogram
+      const c = $('hist'), x = c.getContext('2d'), W = c.width, H = c.height, bins = 14, top = 0.14;
+      x.clearRect(0, 0, W, H);
+      const counts = Array.from({ length: bins }, () => ({ ok: 0, bad: 0 }));
+      for (const b of BAT) counts[Math.min(bins - 1, Math.floor(b.mean / top * bins))][b.verdict.ok ? 'ok' : 'bad']++;
+      const mx = Math.max(...counts.map((k) => k.ok + k.bad));
+      const bw = (W - 40) / bins;
+      x.font = '18px ui-monospace, monospace';
+      counts.forEach((k, i) => {
+        const h1 = k.ok / mx * (H - 50), h2 = k.bad / mx * (H - 50);
+        x.fillStyle = '#34d6ff'; x.fillRect(30 + i * bw + 2, H - 28 - h1, bw - 4, h1);
+        x.fillStyle = '#ff4a4a'; x.fillRect(30 + i * bw + 2, H - 28 - h1 - h2, bw - 4, h2);
+      });
+      const thx = 30 + 0.06 / top * (W - 40);
+      x.strokeStyle = '#ffab2e'; x.setLineDash([6, 5]); x.lineWidth = 2; x.beginPath(); x.moveTo(thx, 8); x.lineTo(thx, H - 28); x.stroke(); x.setLineDash([]);
+      x.fillStyle = '#ffab2e'; x.fillText('limit 6 cm', thx + 6, 24);
+      x.fillStyle = '#1c7a35';
+      for (let k = 0; k <= top * 100; k += 2) x.fillText(String(k), 30 + k / 100 / top * (W - 40) - 6, H - 6);
+      x.fillText('cm', W - 30, H - 6);
+    }
+
+    // --- timeline ticks / chart ------------------------------------------------
+    function buildTicks() {
+      document.querySelectorAll('.tick').forEach((e) => e.remove());
+      $('seek').max = cur.dur;
+      if (cur.batch) return;
+      for (const l of cur.S.log) {
+        if (l.lvl === 'info') continue;
+        const d = document.createElement('div');
+        d.className = 'tick';
+        d.style.left = (l.t / cur.dur * 100) + '%';
+        d.style.background = l.lvl === 'bad' ? '#ff4a4a' : l.lvl === 'warn' ? '#ffab2e' : '#39ff6a';
+        d.title = `${l.t.toFixed(2)} s · ${l.msg}`;
+        d.onclick = () => { st.t = l.t; };
+        $('tl').appendChild(d);
+      }
+      $('legend').innerHTML = cur.batch ? '' : '<span class="cy">━ path error</span><span class="ok">━ altitude</span><span class="warn">┅ max error limit</span>';
+    }
+
+    function drawChart() {
+      const c = $('chart'), r = c.getBoundingClientRect(), dpr = Math.min(2, devicePixelRatio);
+      if (c.width !== Math.round(r.width * dpr)) { c.width = Math.round(r.width * dpr); c.height = Math.round(r.height * dpr); }
+      const x = c.getContext('2d'), W = c.width, H = c.height;
+      x.clearRect(0, 0, W, H);
+      x.font = `${10 * dpr}px ui-monospace, monospace`;
+      const X = (t) => t / cur.dur * W;
+      if (cur.batch) {
+        // Scatter: gust strength vs mean error
+        const gx = (g) => 40 * dpr + g / 2.4 * (W - 60 * dpr), ey = (e) => H - 14 * dpr - Math.min(1, e / 0.14) * (H - 24 * dpr);
+        x.strokeStyle = '#0d3318'; x.lineWidth = 1;
+        for (let e = 0; e <= 0.14; e += 0.02) { x.beginPath(); x.moveTo(40 * dpr, ey(e)); x.lineTo(W, ey(e)); x.stroke(); x.fillStyle = '#1c7a35'; x.fillText((e * 100).toFixed(0) + ' cm', 2, ey(e) + 3 * dpr); }
+        x.strokeStyle = '#ffab2e'; x.setLineDash([5 * dpr, 4 * dpr]); x.beginPath(); x.moveTo(40 * dpr, ey(0.06)); x.lineTo(W, ey(0.06)); x.stroke(); x.setLineDash([]);
+        for (const b of BAT) { x.fillStyle = b.verdict.ok ? '#34d6ff' : '#ff4a4a'; x.beginPath(); x.arc(gx(b.gustAmp), ey(b.mean), 3.5 * dpr, 0, 7); x.fill(); }
+        x.fillStyle = '#39ff6a'; x.fillText('MEAN PATH ERROR vs SIDE GUST STRENGTH (m/s²) · each dot = one simulated throw', 46 * dpr, 12 * dpr);
+        x.fillStyle = '#1c7a35'; for (let g = 0; g <= 2.4; g += 0.4) x.fillText(g.toFixed(1), gx(g) - 6 * dpr, H - 2);
+        return;
+      }
+      const F = cur.S.frames, th = cur.sc.thresh?.max ?? 0.25;
+      const emax = Math.max(th * 1.15, ...F.map((f) => f.err ?? 0)), Y = (e) => H - 4 - Math.min(1, e / emax) * (H - 18 * dpr), A = (z) => H - 4 - z / 2.2 * (H - 18 * dpr);
+      x.strokeStyle = '#0d3318'; x.lineWidth = 1;
+      for (let s = 0; s < cur.dur; s += 5) { x.beginPath(); x.moveTo(X(s), 0); x.lineTo(X(s), H); x.stroke(); x.fillStyle = '#1c7a35'; x.fillText(s + 's', X(s) + 3, H - 4); }
+      x.strokeStyle = '#ffab2e'; x.setLineDash([5 * dpr, 4 * dpr]); x.beginPath(); x.moveTo(0, Y(th)); x.lineTo(W, Y(th)); x.stroke(); x.setLineDash([]);
+      x.fillStyle = '#ffab2e'; x.fillText(`${(th * 100).toFixed(0)} cm`, 4, Y(th) - 3);
+      x.lineWidth = 1.5 * dpr; x.strokeStyle = '#39ff6a'; x.globalAlpha = 0.55; x.beginPath();
+      F.forEach((f, i) => (i ? x.lineTo(X(f.t), A(f.p[2] - K.Z0)) : x.moveTo(X(f.t), A(f.p[2] - K.Z0)))); x.stroke(); x.globalAlpha = 1;
+      x.strokeStyle = '#34d6ff'; x.beginPath(); let pen = false;
+      for (const f of F) { if (f.err == null) { pen = false; continue; } pen ? x.lineTo(X(f.t), Y(f.err)) : x.moveTo(X(f.t), Y(f.err)); pen = true; }
+      x.stroke();
+      // grey out the future
+      x.fillStyle = 'rgba(0,0,0,0.55)'; x.fillRect(X(st.t), 0, W - X(st.t), H);
+      x.strokeStyle = '#fff'; x.lineWidth = 1; x.beginPath(); x.moveTo(X(st.t), 0); x.lineTo(X(st.t), H); x.stroke();
+    }
+
+    // --- per-frame HUD ---------------------------------------------------------
+    function sample(t) {
+      const F = cur.S.frames, i = Math.max(0, Math.min(F.length - 2, Math.floor(t / FDT)));
+      const a = F[i], b = F[i + 1], u = Math.max(0, Math.min(1, (t - a.t) / ((b.t - a.t) || 1)));
+      return { f: u < 0.5 ? a : b, p: a.p.map((v, k) => v + (b.p[k] - v) * u), q: nlerp(a.q, b.q, u), i };
+    }
+    const f3 = (v) => v.map((x) => (x >= 0 ? '+' : '') + x.toFixed(2)).join(' ');
+    const setBar = (el, v) => { const w = Math.min(50, Math.abs(v) / 100 * 50); el.style.width = w + '%'; el.style.left = (v >= 0 ? 50 : 50 - w) + '%'; };
+
+    $('motors').innerHTML = ['FL', 'FR', 'RR', 'RL'].map((n, i) => `<div class="mot" id="m${i}"><div class="col"><i></i></div><span>M${i + 1} ${n}</span><span class="v">0</span></div>`).join('');
+
+    function hud(s) {
+      const { f, p } = s, S = cur.S;
+      $('t_t').textContent = `${st.t.toFixed(2)} s`;
+      const modeCls = f.crashed || f.eStop || f.motorFail >= 0 ? 'bad' : (!f.fixOK || /FAILSAFE|LOW/.test(f.mode)) ? 'warn' : f.armed ? 'cy' : 'ok';
+      $('t_mode').textContent = f.mode; $('t_mode').className = 'big ' + modeCls;
+      $('t_pos').textContent = f3(p) + ' m';
+      $('t_alt').textContent = (p[2] - K.Z0).toFixed(2) + ' m';
+      const spd = Math.hypot(...f.v);
+      $('t_spd').textContent = `${spd.toFixed(2)} m/s`;
+      const yd = ((f.yaw * 180 / Math.PI) % 360 + 360) % 360, ye = ((f.yawEst * 180 / Math.PI) % 360 + 360) % 360;
+      $('t_hdg').innerHTML = `${yd.toFixed(0)}° <span class="dim">est</span> ${ye.toFixed(0)}°`;
+      $('t_err').textContent = f.err == null ? '--' : cm(f.err);
+      $('t_err').className = 'big ' + (f.err == null ? '' : f.err > (cur.sc.thresh?.max ?? 0.25) ? 'bad' : f.err > 0.08 ? 'warn' : 'cy');
+      $('t_errs').textContent = `${cm(f.errMean)} / ${cm(f.errMax)}`;
+      $('t_fix').innerHTML = f.fixOK ? '<span class="ok">CAM+LiDAR · 80 ms</span>' : `<span class="warn">LOST ${f.fixAge.toFixed(1)} s / ${K.LOST_AFTER.toFixed(1)}</span>`;
+      const bars = f.rssi > -52 ? '▂▄▆█' : f.rssi > -58 ? '▂▄▆' : '▂▄';
+      $('t_link').innerHTML = `<span class="ok">${bars}</span> ${f.rssi.toFixed(0)} dBm`;
+      $('t_bat').innerHTML = `${f.bat.toFixed(0)} % <span class="dim">${(3.3 + 0.9 * f.bat / 100).toFixed(2)} V</span>`;
+      $('t_batbar').style.width = f.bat + '%';
+      $('t_batbar').style.background = f.bat < 15 ? '#ff4a4a' : f.bat < 25 ? '#ffab2e' : '#39ff6a';
+      $('t_wind').innerHTML = f.gust > 0.05 ? `<span class="warn">GUST ${f.gust.toFixed(2)} m/s²</span>` : `${f.wind.toFixed(2)} m/s²`;
+
+      // attitude from orientation
+      const up = qrot(s.q, [0, 0, 1]), right = qrot(s.q, [1, 0, 0]), fwd = qrot(s.q, [0, 1, 0]);
+      const pitch = Math.asin(Math.max(-1, Math.min(1, fwd[2]))), roll = Math.atan2(-right[2], up[2]);
+      $('t_rp').textContent = `${(roll * 57.3).toFixed(1)}° / ${(pitch * 57.3).toFixed(1)}°`;
+      drawAtt(roll, pitch, f);
+      for (const [k, id] of [['r', 'r'], ['p', 'p'], ['t', 't']]) { setBar($('s_' + id), f.stick[k]); $('v_' + id).textContent = f.stick[k].toFixed(0); }
+      f.motors.forEach((m, i) => {
+        const el = $('m' + i);
+        el.querySelector('i').style.height = (m * 100) + '%';
+        el.querySelector('i').style.background = i === f.motorFail ? '#ff4a4a' : m > 0.92 ? '#ffab2e' : '#39ff6a';
+        el.querySelector('.v').textContent = i === f.motorFail ? 'DEAD' : (m * 100).toFixed(0);
+        el.classList.toggle('dead', i === f.motorFail);
+      });
+
+      const w = [];
+      if (f.warn) w.push(`<div class="chip bad blink">OBSTACLE AHEAD · ${f.warn.label} ${f.warn.d.toFixed(2)} m${isFinite(f.warn.ttc) ? ' · TTC ' + f.warn.ttc.toFixed(1) + ' s' : ''}</div>`);
+      if (!f.fixOK) w.push(`<div class="chip warn blink">DRONE FIX LOST · ${f.fixAge.toFixed(1)} s</div>`);
+      if (f.motorFail >= 0) w.push(`<div class="chip bad blink">MOTOR ${f.motorFail + 1} FAILURE</div>`);
+      if (f.eStop) w.push('<div class="chip bad">EMERGENCY STOP</div>');
+      if (f.bat < 20) w.push(`<div class="chip warn ${f.bat < 15 ? 'blink' : ''}">LOW BATTERY ${f.bat.toFixed(0)} %</div>`);
+      if (f.gust > 0.1) w.push('<div class="chip warn">WIND GUST</div>');
+      if (f.crashed) w.push('<div class="chip bad">CRASHED · DISARMED</div>');
+      if (!w.length) w.push('<div class="chip ok">ALL SYSTEMS NOMINAL</div>');
+      $('warns').innerHTML = w.join('');
+      droneLbl.element.textContent = `${cur.sc.id} · ${(p[2] - K.Z0).toFixed(2)} m`;
+    }
+
+    function drawAtt(roll, pitch, f) {
+      const c = $('att'), x = c.getContext('2d'), W = c.width, H = c.height;
+      x.save(); x.clearRect(0, 0, W, H);
+      x.beginPath(); x.rect(0, 0, W, H); x.clip();
+      x.translate(W / 2, H / 2); x.rotate(-roll);
+      const off = pitch * 57.3 * 4;
+      x.fillStyle = '#0b2f4a'; x.fillRect(-W, -H * 2 + off, W * 2, H * 2);
+      x.fillStyle = '#2a1d0c'; x.fillRect(-W, off, W * 2, H * 2);
+      x.strokeStyle = '#fff'; x.lineWidth = 2; x.beginPath(); x.moveTo(-W, off); x.lineTo(W, off); x.stroke();
+      x.lineWidth = 1; x.font = '16px ui-monospace, monospace'; x.fillStyle = '#cfe';
+      for (let d = -30; d <= 30; d += 10) { if (!d) continue; const y = off - d * 4; x.beginPath(); x.moveTo(-30, y); x.lineTo(30, y); x.stroke(); x.fillText(String(d), 36, y + 5); }
+      x.restore();
+      x.strokeStyle = f.crashed ? '#ff4a4a' : '#ffd23f'; x.lineWidth = 4;
+      x.beginPath(); x.moveTo(W / 2 - 70, H / 2); x.lineTo(W / 2 - 22, H / 2); x.lineTo(W / 2 - 10, H / 2 + 12); x.moveTo(W / 2 + 70, H / 2); x.lineTo(W / 2 + 22, H / 2); x.lineTo(W / 2 + 10, H / 2 + 12); x.stroke();
+      x.fillStyle = '#ffd23f'; x.fillRect(W / 2 - 3, H / 2 - 3, 6, 6);
+      x.strokeStyle = 'rgba(57,255,106,0.4)'; x.lineWidth = 2; x.strokeRect(1, 1, W - 2, H - 2);
+    }
+
+    let lastLogKey = '';
+    function renderLog(t) {
+      const entries = cur.batch ? batchLog(t) : cur.S.log.filter((l) => l.t <= t);
+      const show = entries.slice(-9), key = show.length + ':' + (show[show.length - 1]?.t ?? '');
+      if (key === lastLogKey) return;
+      lastLogKey = key;
+      $('log').innerHTML = show.map((l) => `<div class="${l.lvl}${t - l.t < 1.5 ? ' fresh' : ''}" data-t="${l.t}"><span>${l.t.toFixed(2).padStart(6, ' ')}</span>${l.msg}</div>`).join('');
+      $('log').querySelectorAll('div').forEach((d) => d.onclick = () => { st.t = +d.dataset.t; });
+    }
+    function batchLog(t) {
+      const out = [{ t: 0, msg: `BATCH START · ${BAT.length} randomized throws`, lvl: 'info' }];
+      for (const b of BAT) {
+        if (b.S.duration <= t) out.push({ t: b.S.duration, msg: `${b.sc.id} ${b.verdict.ok ? 'PASS' : 'FAIL'} · mean ${cm(b.mean)} · ${b.D.toFixed(2)} m throw`, lvl: b.verdict.ok ? 'ok' : 'bad' });
+      }
+      return out.sort((a, b) => a.t - b.t);
+    }
+
+    function banner(t) {
+      const el = $('banner');
+      let show = null;
+      if (!cur.batch) {
+        const S = cur.S;
+        const recent = S.log.filter((l) => l.t <= t && t - l.t < 3.2 && (l.lvl === 'bad' || /FAILSAFE|ABORT|EMERGENCY|LOST/.test(l.msg)));
+        const last = recent[recent.length - 1];
+        if (last && /COLLISION|IMPACT/.test(last.msg)) show = { cls: S.expectCrash ? 'warn' : 'bad', txt: S.expectCrash ? 'E-STOP · IMPACT' : 'CRASH DETECTED', sub: last.msg };
+        else if (last && /MOTOR/.test(last.msg)) show = { cls: 'bad', txt: 'MOTOR FAILURE', sub: last.msg };
+        else if (last && /EMERGENCY/.test(last.msg)) show = { cls: 'warn', txt: 'EMERGENCY STOP', sub: 'motors off · operator command' };
+        else if (last && /FAILSAFE/.test(last.msg)) show = { cls: 'warn', txt: 'FAILSAFE · AUTO LAND', sub: last.msg };
+        else if (last && /ABORT/.test(last.msg)) show = { cls: 'warn', txt: 'LOW BATTERY · RTH', sub: last.msg };
+        if (!show && t >= cur.dur - 0.05) show = { cls: S.verdict.cls, txt: S.verdict.txt, sub: S.errMeanFinal != null ? `mean ${cm(S.errMeanFinal)} · max ${cm(S.errMaxFinal)}` : (S.impact ? `impact ${S.impact.toFixed(2)} m/s` : '') };
+      } else if (t >= cur.dur - 0.05) {
+        const ok = BAT.filter((b) => b.verdict.ok).length;
+        show = { cls: 'warn', txt: `${ok} / ${BAT.length} PASSED`, sub: 'failures all under side gusts > 1.1 m/s²' };
+      }
+      if (!show) { el.style.display = 'none'; return; }
+      el.style.display = 'block';
+      el.className = show.cls; el.style.color = show.cls === 'bad' ? '#ff4a4a' : show.cls === 'warn' ? '#ffab2e' : '#39ff6a';
+      el.innerHTML = `${show.txt}${show.sub ? `<small>${show.sub}</small>` : ''}`;
+    }
+
+    // --- update scene for time t ------------------------------------------------
+    const tmpQ = new THREE.Quaternion();
+    function update(t, rdt) {
+      if (cur.batch) return updateBatch(t, rdt);
+      const s = sample(t), { f } = s;
+      drone.g.position.set(...s.p);
+      drone.g.quaternion.set(...s.q);
+      drone.props.forEach((pr, k) => { pr.blade.rotation.z += (k % 2 ? -1 : 1) * f.motors[k] * rdt * 90; pr.disc.material.opacity = 0.05 + 0.2 * f.motors[k]; });
+      drone.body.color.setHex(f.crashed ? 0x3a1414 : 0x22282c);
+      shadow.position.set(s.p[0], s.p[1], 0.003);
+      shadow.material.opacity = Math.max(0.1, 0.55 - s.p[2] * 0.18);
+      shadow.scale.setScalar(1 + s.p[2] * 0.25);
+      dropLine.geometry.setFromPoints([new THREE.Vector3(s.p[0], s.p[1], s.p[2]), new THREE.Vector3(s.p[0], s.p[1], 0)]);
+      dropLine.computeLineDistances();
+      cur.trail.geometry.setDrawRange(0, s.i + 1);
+      goalMk.visible = !!f.goal && !f.crashed;
+      if (f.goal) { goalMk.position.set(...f.goal); goalMk.rotation.z += rdt * 2; }
+      estMk.visible = f.armed || !f.fixOK;
+      estMk.position.set(...f.est);
+      estMk.material.color.setHex(f.fixOK ? 0xffffff : COL.am);
+      lostLbl.element.textContent = f.fixOK ? '' : `LAST FIX · ${f.fixAge.toFixed(1)}s`;
+      if (cur.beacon) {
+        const { b, ball, arcLine, lbl } = cur.beacon, n = b.pts.length;
+        const u = Math.max(0, Math.min(1, (t - b.t0) / b.dur)), k = Math.min(n - 1, Math.floor(u * (n - 1)));
+        const pa = b.pts[k], pb = b.pts[Math.min(n - 1, k + 1)], w = u * (n - 1) - k;
+        ball.position.set(pa[0] + (pb[0] - pa[0]) * w, pa[1] + (pb[1] - pa[1]) * w, pa[2] + (pb[2] - pa[2]) * w);
+        arcLine.geometry.setDrawRange(0, t < b.t0 ? 0 : k + 2);
+        lbl.position.copy(ball.position).add(new THREE.Vector3(0, 0, 0.1));
+      }
+      for (const sp of cur.sparks) sp.update(t);
+      if (st.follow) followCam(new THREE.Vector3(...s.p), rdt);
+      hud(s);
+    }
+
+    function updateBatch(t, rdt) {
+      const i = Math.floor(t / FDT);
+      for (const r of cur.runs) {
+        const F = r.b.S.frames, k = Math.min(F.length - 1, i), p = F[k];
+        r.d.position.set(p[0], p[1], p[2]);
+        r.d.rotation.z += rdt * 3;
+        r.trail.geometry.setDrawRange(0, k + 1);
+      }
+      const done = BAT.filter((b) => b.S.duration <= t).length;
+      $('b_runs').textContent = `${BAT.length}  (${done} landed)`;
+    }
+
+    const lastFollow = new THREE.Vector3();
+    function followCam(p, rdt) {
+      const k = 1 - Math.exp(-2.5 * rdt);
+      const tgt = controls.target.clone().lerp(new THREE.Vector3(p.x, p.y, Math.max(0.4, p.z)), k);
+      const d = tgt.clone().sub(controls.target);
+      controls.target.copy(tgt); camera.position.add(d);
+    }
+
+    // --- loop ---------------------------------------------------------------
+    let last = performance.now();
+    function frame(now) {
+      const rdt = Math.min(0.1, (now - last) / 1000); last = now;
+      if (cur) {
+        if (st.playing && $('matrix').style.display !== 'flex') {
+          st.t += rdt * st.speed;
+          if (st.t >= cur.dur) {
+            st.t = cur.dur;
+            if (st.auto) { st.endHold += rdt; if (st.endHold > 3) load(st.i + 1); }
+            else { st.playing = false; $('play').textContent = '▶'; }
+          }
+        }
+        update(st.t, st.playing ? rdt * st.speed : 0);
+        $('seek').value = st.t;
+        $('clock').textContent = `${st.t.toFixed(1)} / ${cur.dur.toFixed(1)} s`;
+        drawChart(); renderLog(st.t); banner(st.t);
+      }
+      controls.update();
+      renderer.render(scene, camera);
+      labels.render(scene, camera);
+      requestAnimationFrame(frame);
+    }
+
+    // --- controls ---------------------------------------------------------------
+    function togglePlay() {
+      if (!st.playing && st.t >= cur.dur) st.t = 0;
+      st.playing = !st.playing; $('play').textContent = st.playing ? '❚❚' : '▶';
+    }
+    $('play').onclick = togglePlay;
+    $('restart').onclick = () => { st.t = 0; st.endHold = 0; st.playing = true; $('play').textContent = '❚❚'; fitCamera(); };
+    $('prev').onclick = () => load(st.i - 1);
+    $('next').onclick = () => load(st.i + 1);
+    $('sel').onchange = (e) => load(+e.target.value);
+    $('seek').oninput = (e) => { st.t = +e.target.value; st.endHold = 0; };
+    document.querySelectorAll('[data-sp]').forEach((b) => b.onclick = () => {
+      st.speed = +b.dataset.sp; document.querySelectorAll('[data-sp]').forEach((x) => x.classList.toggle('on', x === b));
+    });
+    $('follow').onclick = () => { st.follow = !st.follow; $('follow').classList.toggle('on', st.follow); };
+    $('auto').onclick = () => { st.auto = !st.auto; $('auto').classList.toggle('on', st.auto); if (st.auto && !st.playing) togglePlay(); };
+    $('mbtn').onclick = () => showMatrix(true);
+    $('mclose').onclick = () => showMatrix(false);
+    $('matrix').onclick = (e) => { if (e.target.id === 'matrix') showMatrix(false); };
+    controls.addEventListener('start', () => { if (st.follow) { /* keep following, but let the user orbit around the drone */ } });
+    addEventListener('keydown', (e) => {
+      if (e.target.tagName === 'SELECT') return;
+      if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+      else if (e.key === 'ArrowRight') st.t = Math.min(cur.dur, st.t + 1);
+      else if (e.key === 'ArrowLeft') { st.t = Math.max(0, st.t - 1); st.endHold = 0; }
+      else if (e.key === ']' || e.key === 'PageDown') load(st.i + 1);
+      else if (e.key === '[' || e.key === 'PageUp') load(st.i - 1);
+      else if (e.key === 'm' || e.key === 'M') showMatrix($('matrix').style.display !== 'flex');
+      else if (e.key === 'f' || e.key === 'F') $('follow').click();
+      else if (e.key === 'a' || e.key === 'A') $('auto').click();
+      else if (e.key === 'r' || e.key === 'R') $('restart').click();
+      else if (e.key === 'Escape') showMatrix(false);
+    });
+
+    // --- boot: run every simulation up front, then show the matrix -------------
+    requestAnimationFrame(() => setTimeout(() => {
+      RES = SCENARIOS.map((sc) => run(sc));
+      BAT = runBatch();
+      $('sel').innerHTML = TESTS().map((it, i) => `<option value="${i}">${it.sc.id} · ${it.sc.name}</option>`).join('');
+      buildMatrix();
+      const want = new URLSearchParams(location.search).get('t');
+      const idx = want ? TESTS().findIndex((it) => it.sc.id === want.toUpperCase()) : -1;
+      load(Math.max(0, idx));
+      if (idx < 0) showMatrix(true);
+      $('loading').remove();
+      requestAnimationFrame(frame);
+    }, 30));
+  </script>
+</body>
+</html>
