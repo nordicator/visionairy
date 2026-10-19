@@ -293,6 +293,128 @@ def help_panel(img):
         text(img, what, (x0 + 190, y), WHITE, 0.45)
 
 
+AI_W = 372                # AI panel width
+KIND_COLOR = {"move": ACCENT, "hover": (120, 120, 120), "takeoff": GREEN, "land": YELLOW}
+PHASE_STYLE = {"idle": ("IDLE", GREY), "thinking": ("THINKING", YELLOW), "running": ("RUNNING", GREEN)}
+
+
+def wrap(s, n):
+    """Split s into lines of at most n characters, on spaces where possible."""
+    out, line = [], ""
+    for word in str(s).split():
+        while len(word) > n:
+            if line:
+                out.append(line)
+                line = ""
+            out.append(word[:n])
+            word = word[n:]
+        if line and len(line) + 1 + len(word) > n:
+            out.append(line)
+            line = word
+        else:
+            line = f"{line} {word}" if line else word
+    if line:
+        out.append(line)
+    return out
+
+
+def ai_panel(img, st):
+    """What the AI pilot is doing: model + phase, command, plan progress, guard, hold, log file."""
+    ai = st["ai"]
+    x0, y0 = 12, 38                                   # under the top bar, where nothing else sits
+    lines = []                                        # (text, color, scale) or ("BAR", plan)
+    label, color = PHASE_STYLE.get(ai["phase"], (ai["phase"].upper(), GREY))
+    if ai["phase"] == "thinking":
+        label += f" {ai['phase_s']:.1f}s"
+    elif ai["phase"] == "running" and ai["tool"]:
+        label += f" {ai['tool']}"
+    lines.append(("HEAD", label, color))
+    if ai["command"]:
+        for i, ln in enumerate(wrap("> " + ai["command"], 50)[:2]):
+            lines.append((ln, WHITE, 0.42))
+    plan = ai["plan"]
+    if plan:
+        lines.append((f"PLAN step {plan['step']}/{plan['steps']}: {plan['what']}  {plan['left']:.1f}s left",
+                      ACCENT, 0.42))
+        lines.append(("BAR", plan))
+    elif ai["result"]:
+        ok = ai["result"] == "done"
+        for ln in wrap(("PLAN DONE" if ok else "PLAN " + ai["result"].upper()), 50)[:2]:
+            lines.append((ln, GREEN if ok else RED, 0.42))
+        if ai["ended"]:
+            lines.append(("BAR", ai["ended"]))
+    if ai["reply"]:
+        for ln in wrap("AI: " + ai["reply"], 52)[:2]:
+            lines.append((ln, (200, 200, 200), 0.4))
+    g, gd = ai["guard"]
+    gc = {"watching": GREEN, "stopped": RED, "standby": GREY, "off": YELLOW}.get(g, GREY)
+    if gd and g == "watching":
+        gc = RED                                      # watching but blind
+    for ln in wrap(f"GUARD {g.upper()}" + (f": {gd}" if gd else ""), 50)[:2]:
+        lines.append((ln, gc, 0.42))
+    h, hv = ai["hold"]
+    off = [a.upper() for a, (on, _) in ai.get("axes", {}).items() if not on]
+    caps = "  max " + "/".join(f"{cap:.0f}" for _, cap in ai.get("axes", {}).values()) + "%" \
+        if any(cap > 20.5 for _, cap in ai.get("axes", {}).values()) else ""
+    if h.startswith("holding"):
+        lines.append((f"HOLD ON  X{hv['x']:+5.1f}  Y{hv['y']:+5.1f}{caps}" + (f"  ({'+'.join(off)} OFF)" if off else ""),
+                      YELLOW if off else GREEN, 0.42))
+    else:
+        lines.append(("HOLD " + h.upper() + (f"  ({'+'.join(off)} OFF)" if off else ""),
+                      YELLOW if h == "off" or off else GREY, 0.42))
+    dp = ai.get("depth")
+    if dp and not dp.get("available"):
+        lines.append(("DEPTH OFF: " + str(dp.get("why", ""))[:40], GREY, 0.4))
+    elif dp:
+        ahead = "" if dp.get("ahead_m") is None else f"ahead ~{dp['ahead_m']:.1f} m  "
+        lines.append((f"DEPTH {ahead}trust {dp['trust'].upper()}", YELLOW if dp["trust"] == "low" else GREEN, 0.42))
+        if dp["trust"] == "low" and dp.get("why"):
+            lines.append((wrap(dp["why"][0], 54)[0], (170, 170, 170), 0.36))
+    for msg, level in ai.get("alerts", [])[:4]:
+        for ln in wrap(msg, 50)[:2]:
+            lines.append((ln, RED if level == "act" else YELLOW, 0.42))
+    if ai["log"]:
+        lines.append((f"log: logs/{ai['log']}", (120, 120, 120), 0.36))
+
+    height = 10 + sum(14 if ln[0] == "BAR" else 24 if ln[0] == "HEAD" else 17 for ln in lines)
+    panel(img, x0, y0, x0 + AI_W, y0 + height, 0.65)
+    y = y0 + 6
+    for ln in lines:
+        if ln[0] == "HEAD":
+            y += 18
+            text(img, "AI", (x0 + 10, y), ACCENT, 0.5, 1)
+            text(img, ai["model"], (x0 + 34, y), WHITE, 0.45)
+            if ln[1].startswith("THINKING") and int(st["t"] * 3) % 2:
+                cv2.circle(img, (x0 + AI_W - 14 - text_w(ln[1], 0.45) - 10, y - 5), 4, ln[2], -1, cv2.LINE_AA)
+            text(img, ln[1], (x0 + AI_W - 10, y), ln[2], 0.45, 1, "r")
+            y += 6
+        elif ln[0] == "BAR":
+            plan_bar(img, x0 + 10, y + 2, AI_W - 20, 8, ln[1])
+            y += 14
+        else:
+            y += 17
+            text(img, ln[0], (x0 + 10, y - 4), ln[1], ln[2])
+
+
+def text_w(s, scale, thick=1):
+    return cv2.getTextSize(s, FONT, scale, thick)[0][0]
+
+
+def plan_bar(img, x, y, w, h, plan):
+    """The plan as a strip of steps sized by duration, the current one outlined, a cursor at now."""
+    total = sum(plan["durations"]) or 1.0
+    cx = x
+    for i, (kind, d) in enumerate(zip(plan["kinds"], plan["durations"])):
+        sw = max(2, round(d / total * w))
+        cv2.rectangle(img, (cx, y), (min(x + w, cx + sw - 1), y + h), KIND_COLOR.get(kind, GREY), -1)
+        if i + 1 == plan["step"]:
+            cv2.rectangle(img, (cx - 1, y - 2), (min(x + w, cx + sw), y + h + 2), WHITE, 1)
+        cx += sw
+    f = min(1.0, plan["elapsed"] / plan["total"]) if plan["total"] else 0.0
+    px = x + round(f * w)
+    cv2.line(img, (px, y - 3), (px, y + h + 3), WHITE, 2)
+
+
 def action_banner(img, st):
     flag, left = st["action"]
     if not flag:
@@ -320,6 +442,10 @@ def draw(img, st):
     if st["goto"]:
         goto_marker(img, st)
     chips(img, st)
+    if st.get("ai"):
+        ai_panel(img, st)
+        if st["ai"].get("landing") and int(st["t"] * 3) % 2:
+            boxed(img, "AUTO-LANDING", (W // 2, H // 2 - 60), RED, 0.9, 2)
     if st["fly"]:
         speed_buttons(img, st["speed"])
         if not st["focused"]:

@@ -16,6 +16,14 @@ correction, then it drops back to a slow hold.
 
 Limits: a sideways slide from a forward camera can also be the drone turning (yaw), and a scene
 with no texture (blank wall, sky) gives no estimate – the HUD then shows "low texture".
+
+What a real flight log showed going wrong, and the guards against it:
+  - tilting / turning reads as huge drift (1.7 frame-widths/s): trim drift is slow, so readings
+    above MAX_DRIFT, or while the picture is rotating faster than MAX_SPIN, aren't trimmed on
+  - Z was trimmed, but throttle 128 already holds altitude, so a Z trim is a constant climb or sink:
+    only X and Y are auto-trimmed
+  - learned trim was saved and reloaded, so every flight started worse: auto-trim may only move
+    AUTO_SPAN away from the flight's starting trim, and drone.py saves only the trim you set by hand
 """
 import json
 import math
@@ -37,6 +45,10 @@ SETTLE = 0.7              # s with no movement keys before drift is believed (mo
 AFTER_TAKEOFF = 2.0       # s after take off before auto-trim starts
 CALIBRATE_SECONDS = 3.0   # s of fast correction each time the pilot stops (and after take off)
 CALIBRATE_GAIN = 2.5      # gain and max rate are multiplied by this while calibrating
+AUTO_AXES = ("x", "y")    # never Z: throttle 128 = hold altitude, a trim there is a constant climb / sink
+MAX_DRIFT = 0.15          # frame-widths/s; faster than this is a tilt, turn or gust, not trim drift
+MAX_SPIN = 0.15           # rad/s of picture rotation above which the shift isn't believed
+AUTO_SPAN = 10.0          # % stick auto-trim may move each axis away from where the flight started
 
 
 class DriftEstimator:
@@ -45,6 +57,7 @@ class DriftEstimator:
         self.prev = None
         self.prev_t = 0.0
         self.vel = dict.fromkeys(AXES, 0.0)   # drone motion, frame-widths per second (smoothed)
+        self.spin = 0.0                        # picture rotation, rad/s (smoothed): the drone rolling / tilting
         self.points = 0                        # inliers in the last fit
         self.valid = False
 
@@ -75,6 +88,7 @@ class DriftEstimator:
         sx = m[0, 2] / gw / dt                              # scene shift, frame-widths/s (+ = right)
         sy = m[1, 2] / gw / dt                              #                              (+ = down)
         zoom = math.log(math.hypot(m[0, 0], m[1, 0])) / dt  # + = scene growing
+        spin = math.atan2(m[1, 0], m[0, 0]) / dt
         if self.camera == "down":
             raw = {"x": -sx, "y": sy, "z": -zoom}
         else:
@@ -82,6 +96,7 @@ class DriftEstimator:
         k = 1 - math.exp(-dt / SMOOTH_TAU)
         for axis in AXES:
             self.vel[axis] += k * (raw[axis] - self.vel[axis])
+        self.spin += k * (spin - self.spin)
         self.valid = True
 
     def _miss(self):
@@ -95,7 +110,12 @@ class AutoTrim:
     def __init__(self, pilot, enabled=True):
         self.pilot = pilot
         self.enabled = enabled
-        self.state = "off"      # off | waiting | calibrating | learning | steady | paused | low texture
+        self.state = "off"      # off | waiting | calibrating | learning | steady | paused | low texture | unsteady
+        self.skip = set()       # axes not to trim (the supervisor found the estimate reversed there)
+        self.base = None        # trim at the start of this flight; auto-trim stays within AUTO_SPAN of it
+
+    def start_flight(self, trim):
+        self.base = dict(trim)
 
     def update(self, est, dt, airborne_for, idle_for):
         """airborne_for: s since take off (None on the ground); idle_for: s since the last movement key."""
@@ -107,18 +127,29 @@ class AutoTrim:
             self.state = "paused"           # pilot is flying it
         elif not est.valid:
             self.state = "low texture"
+        elif abs(getattr(est, "spin", 0.0)) > MAX_SPIN or max(abs(est.vel[a]) for a in AUTO_AXES) > MAX_DRIFT:
+            self.state = "unsteady"         # tilting, turning or a gust: not trim drift
         else:
             calibrating = (idle_for < SETTLE + CALIBRATE_SECONDS
                            or airborne_for < AFTER_TAKEOFF + CALIBRATE_SECONDS)
             boost = CALIBRATE_GAIN if calibrating else 1.0
             moving = False
-            for axis in AXES:
+            trims = self.pilot.trims()
+            for axis in AUTO_AXES:
+                if axis in self.skip:
+                    continue
                 v = est.vel[axis]
                 if abs(v) > DEADBAND:
                     lim = TRIM_MAX_RATE * boost
                     rate = max(-lim, min(lim, TRIM_GAIN * boost * v))
-                    self.pilot.adjust_trim(axis, -rate * dt)
-                    moving = True
+                    step = -rate * dt
+                    if self.base is not None:   # stay within AUTO_SPAN of the flight's starting trim
+                        mid = self.base.get(axis, 0.0)
+                        lo, hi = mid - AUTO_SPAN, mid + AUTO_SPAN
+                        step = max(lo, min(hi, trims[axis] + step)) - trims[axis]
+                    if step:
+                        self.pilot.adjust_trim(axis, step)
+                        moving = True
             self.state = "calibrating" if calibrating else "learning" if moving else "steady"
 
 
